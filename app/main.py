@@ -2,10 +2,15 @@
 
 import shutil
 import sys
+from pathlib import Path
 
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from .ui import theme
 from .ui.main_window import MainWindow
+
+ICON_PATH = Path(__file__).parent / "ui" / "assets" / "logo" / "SV.ico"
 
 FFMPEG_MISSING_MESSAGE = (
     "SVMixer uses ffmpeg to read and export audio (mp3/wav/m4a), but it "
@@ -19,10 +24,22 @@ FFMPEG_MISSING_MESSAGE = (
 
 
 def main():
+    if sys.platform == "win32":
+        # Without an explicit AppUserModelID, Windows groups the taskbar
+        # icon under python.exe's own icon instead of ours.
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SVMixer.DesktopApp")
+
     app = QApplication(sys.argv)
     app.setApplicationName("SVMixer")
+    app.setWindowIcon(QIcon(str(ICON_PATH)))
+
+    theme.load_fonts()
+    app.setStyleSheet(theme.stylesheet())
 
     window = MainWindow()
+    window.setWindowIcon(QIcon(str(ICON_PATH)))
     window.show()
 
     if shutil.which("ffmpeg") is None:

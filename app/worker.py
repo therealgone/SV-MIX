@@ -38,6 +38,25 @@ class MixWorker(QThread):
         self.progress.emit(message, percent)
 
 
+class DurationProbeWorker(QThread):
+    """Reads each file's duration (shells out to ffprobe via pydub's
+    mediainfo) on a background thread -- doing this on the UI thread for
+    a batch of files blocks the event loop long enough that the window
+    manager flags the app as "not responding".
+    """
+
+    duration_ready = Signal(str, object)  # (filepath, duration_seconds or None)
+
+    def __init__(self, filepaths, parent=None):
+        super().__init__(parent)
+        self.filepaths = list(filepaths)
+
+    def run(self):
+        for path in self.filepaths:
+            duration = pipeline.get_duration_seconds(path)
+            self.duration_ready.emit(path, duration)
+
+
 class ExportWorker(QThread):
     """Runs pipeline.export_mix() on a background thread so the UI stays
     responsive while pydub/ffmpeg encodes the mp3.

@@ -7,6 +7,8 @@ from PySide6.QtWidgets import QFileDialog, QFrame, QLabel, QVBoxLayout
 
 import pipeline
 
+from . import theme
+
 
 class DropArea(QFrame):
     """A prominent drop zone. Accepts dragged-in audio files and is
@@ -19,22 +21,22 @@ class DropArea(QFrame):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setObjectName("dropArea")
-        self.setMinimumHeight(160)
+        self.setFixedHeight(104)
         self.setCursor(Qt.PointingHandCursor)
 
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
         layout.setSpacing(6)
 
-        icon_label = QLabel("\U0001F3B5")
+        icon_label = QLabel("≈")
         icon_label.setAlignment(Qt.AlignCenter)
-        icon_label.setStyleSheet("font-size: 32px;")
+        icon_label.setStyleSheet(f"font-size: 22px; color: {theme.ACCENT};")
 
-        title_label = QLabel("Drag & drop audio files here")
+        title_label = QLabel("Drop audio here")
         title_label.setAlignment(Qt.AlignCenter)
         title_label.setObjectName("dropTitle")
 
-        subtitle_label = QLabel("or click to browse  ·  .mp3, .wav, .m4a")
+        subtitle_label = QLabel("or click to browse  ·  mp3  wav  m4a")
         subtitle_label.setAlignment(Qt.AlignCenter)
         subtitle_label.setObjectName("dropSubtitle")
 
@@ -42,25 +44,25 @@ class DropArea(QFrame):
         layout.addWidget(title_label)
         layout.addWidget(subtitle_label)
 
-        self.setStyleSheet("""
-            #dropArea {
-                border: 2px dashed #9aa5b1;
-                border-radius: 12px;
-                background-color: #f7f9fb;
-            }
-            #dropArea:hover {
-                border-color: #4a90d9;
-                background-color: #eef5fc;
-            }
-            #dropTitle {
-                font-size: 15px;
-                font-weight: 600;
-                color: #2c3e50;
-            }
-            #dropSubtitle {
-                font-size: 12px;
-                color: #7f8c99;
-            }
+        self.setStyleSheet(f"""
+            #dropArea {{
+                border: 1px dashed {theme.NEUTRAL[700]};
+                border-radius: {theme.RADIUS_MD}px;
+                background-color: {theme.NEUTRAL[900]};
+            }}
+            #dropArea:hover {{
+                border-color: {theme.ACCENT};
+                background-color: {theme.ACCENT_RAMP[900]};
+            }}
+            #dropTitle {{
+                font-size: 13px;
+                font-weight: 500;
+                color: {theme.TEXT};
+            }}
+            #dropSubtitle {{
+                font-size: 11px;
+                color: {theme.NEUTRAL[400]};
+            }}
         """)
 
     def mousePressEvent(self, event):
