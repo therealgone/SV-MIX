@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Personal test audio library and generated mixes — never ship these.
+# songs/ in particular typically contains copyrighted commercial audio
+# used only for local testing; it must not be redistributed with the app.
+songs/
+output/
+
+# Editor / OS cruft
+.DS_Store
+.vscode/
+.idea/

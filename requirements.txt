@@ -1,0 +1,13 @@
+librosa>=0.10
+pydub>=0.25
+numpy>=1.23
+soundfile>=0.12
+audioop-lts; python_version >= "3.13"  # pydub needs this on Python 3.13+ (stdlib audioop was removed)
+PySide6>=6.5   # desktop UI (app/) — not needed for the CLI script (mashup.py) alone
+
+# NOTE: ffmpeg must also be installed on your system and available on PATH.
+# pydub shells out to it for decoding/encoding mp3, wav, and m4a files.
+#   macOS:   brew install ffmpeg
+#   Ubuntu:  sudo apt install ffmpeg
+#   Arch:    sudo pacman -S ffmpeg
+#   Windows: download from https://ffmpeg.org/download.html and add to PATH
