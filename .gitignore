@@ -2,12 +2,24 @@
 __pycache__/
 *.pyc
 *.pyo
+.venv/
+venv/
 
 # Personal test audio library and generated mixes — never ship these.
 # songs/ in particular typically contains copyrighted commercial audio
 # used only for local testing; it must not be redistributed with the app.
 songs/
 output/
+
+# Windows build output (see BUILD_WINDOWS.md) — regenerated locally, not
+# something to version control.
+build/
+dist/
+
+# Design-tool export used as a one-time reference for the Nocturne redesign
+# (already fully implemented into app/ui) — not app source, not needed here.
+SVMix UI redesign brief/
+SVMix UI redesign brief.zip
 
 # Editor / OS cruft
 .DS_Store

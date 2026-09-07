@@ -95,19 +95,25 @@ run_app.py          Desktop app entry point
 mashup.py            CLI entry point
 pipeline.py          Core analysis/mixing engine (no UI dependencies)
 app/
-  main.py            QApplication bootstrap, ffmpeg pre-flight check
+  main.py            QApplication bootstrap, window icon, ffmpeg pre-flight check
   worker.py           Background QThread workers (keep the UI responsive)
   ui/
-    main_window.py    Hosts the 3 screens and wires them together
-    upload_screen.py  File list, mix mode / hook type / duration controls
-    processing_screen.py  Progress bar + status while mixing
-    done_screen.py    Preview player, skipped-files list, save/restart
-    drop_area.py       Drag-and-drop / browse widget
-    file_row_widget.py File list row (name, duration, remove button)
+    main_window.py    Hosts the Setup/Studio screens and wires them together
+    title_bar.py      Custom frameless-window chrome (logo, breadcrumb, controls)
+    setup_screen.py   File list, mix mode / hook type / length controls
+    studio_screen.py  Progress ring while mixing, then preview/save/restart
+    widgets.py         Custom-painted controls (segmented switch, dials, ring)
+    theme.py            Nocturne color/spacing tokens + global stylesheet
+    drop_area.py        Drag-and-drop / browse widget
+    file_row_widget.py  File list row (name, duration, remove button)
+    assets/              Bundled fonts, logo, and app icon
+packaging/
+  windows/            PyInstaller spec + Inno Setup script — see BUILD_WINDOWS.md
 ```
 
 See `ARCHITECTURE.md` for a deeper technical breakdown of how the screens,
-workers, and pipeline fit together.
+workers, and pipeline fit together, and `BUILD_WINDOWS.md` for packaging
+SVMixer as a standalone Windows installer.
 
 ## Privacy & offline use
 
@@ -124,4 +130,6 @@ not collect, store, or transmit any user data or telemetry.
   package SVMixer as a compiled/frozen app (e.g. via PyInstaller), keep
   Qt/PySide6 dynamically linked and include the required LGPL attribution
   per Qt's licensing terms.
-# SV-MIX
+- See `BUILD_WINDOWS.md` for step-by-step instructions on building a
+  standalone `SVMixer-Setup.exe` Windows installer with PyInstaller +
+  Inno Setup.
