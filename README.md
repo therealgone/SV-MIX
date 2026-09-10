@@ -39,13 +39,27 @@ script, both built on the same analysis engine (`pipeline.py`).
 
 ## Requirements
 
+> **Installing SVMixer from the Microsoft Store or the `Setup.exe`
+> installer?** You don't need any of this — those builds bundle ffmpeg and
+> ship everything they need. The requirements below apply only to running
+> SVMixer from source.
+
 - Python 3.9+ (3.13+ also supported — see `requirements.txt`)
 - [ffmpeg](https://ffmpeg.org/) installed and available on your system `PATH`
   (used by `pydub` to decode/encode mp3, wav, and m4a files). The GUI will
   warn you on startup if it can't find ffmpeg.
+
   - **Windows:** download from https://ffmpeg.org/download.html and add it to PATH
   - **macOS:** `brew install ffmpeg`
   - **Linux:** `sudo apt install ffmpeg` (or your distro's package manager)
+
+  On Windows you can instead fetch the same LGPL build the packaged
+  releases use into `vendor/ffmpeg/`, which SVMixer prefers over anything
+  on `PATH`:
+
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File packaging\windows\fetch_ffmpeg.ps1
+  ```
 
 ## Installation
 
@@ -94,6 +108,7 @@ BPM thresholds behind each hook type, etc. — live at the top of
 run_app.py          Desktop app entry point
 mashup.py            CLI entry point
 pipeline.py          Core analysis/mixing engine (no UI dependencies)
+ffmpeg_support.py    Finds the bundled ffmpeg (falls back to PATH)
 app/
   main.py            QApplication bootstrap, window icon, ffmpeg pre-flight check
   worker.py           Background QThread workers (keep the UI responsive)
@@ -109,6 +124,9 @@ app/
     assets/              Bundled fonts, logo, and app icon
 packaging/
   windows/            PyInstaller spec + Inno Setup script — see BUILD_WINDOWS.md
+    fetch_ffmpeg.ps1  Downloads the LGPL ffmpeg that gets bundled
+    msix/             Microsoft Store MSIX packaging — see MSIX_STORE.md
+vendor/ffmpeg/       Bundled LGPL ffmpeg (fetched, not committed)
 ```
 
 See `ARCHITECTURE.md` for a deeper technical breakdown of how the screens,

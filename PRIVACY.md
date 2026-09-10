@@ -1,0 +1,129 @@
+# SV Mix — Privacy Policy
+
+**Last updated: 7 September 2026**
+
+Your privacy matters. This Privacy Policy explains what personal data
+SV Mix processes, how it is processed, and for what purposes.
+
+SV Mix ("the app") is a desktop application for Windows that combines audio
+files you already have into a single continuous mix. This policy applies to
+the SV Mix application distributed through the Microsoft Store.
+
+## Summary
+
+**SV Mix does not collect, store, transmit, or share any personal data.**
+
+The app works entirely offline. It has no accounts, no sign-in, no
+analytics, no telemetry, no advertising, and no third-party tracking. It
+makes no network requests of any kind. Nothing you do in SV Mix leaves your
+computer.
+
+## Personal data we collect
+
+**None.**
+
+We do not collect personal data through the app. Specifically, SV Mix does
+not collect:
+
+- Your name, email address, or any contact information
+- Account credentials — the app has no accounts and no sign-in
+- Payment or billing information
+- Location data
+- Contacts, calendar, camera, microphone, or messages
+- Device identifiers, advertising identifiers, or usage analytics
+- Crash reports or diagnostic telemetry
+- The names, contents, or metadata of the audio files you use
+
+## How your files are handled
+
+SV Mix processes audio only on your own device.
+
+- **Files you choose.** The app reads an audio file only when you
+  explicitly select it, by dragging it into the window or picking it in the
+  file browser. It does not scan, index, or browse your drives on its own.
+- **Local processing.** Tempo, energy, and section ("hook") analysis, and
+  all mixing and encoding, run locally on your computer using bundled
+  software. No audio is uploaded anywhere.
+- **Temporary files.** While mixing, the app may write temporary working
+  files to your system's standard temporary folder. These are used only to
+  produce your mix and are not transmitted anywhere.
+- **Saving your mix.** The finished mix is written only to the location you
+  choose in the "Save As" dialog. The app does not save copies elsewhere.
+- **Nothing is retained.** SV Mix keeps no library, history, or record of
+  the files you have opened.
+
+## How we use personal data
+
+Because SV Mix does not collect personal data, there is no personal data for
+us to use. We do not use your data to develop or train AI models, and we do
+not use it for advertising, marketing, or profiling.
+
+## Disclosure of personal data
+
+We do not disclose personal data, because we do not collect any. We do not
+sell, rent, or share personal data with third parties, advertisers, or data
+brokers.
+
+## Your controls
+
+Because no data is collected, there is nothing for you to access, correct,
+export, or delete from us, and no consent to withdraw. You remain in full
+control of your audio files and your saved mixes, which stay on your device
+under your own file system permissions.
+
+If you wish to remove the app entirely, uninstalling it through Windows
+Settings removes the application. Any mixes you saved remain where you chose
+to save them and are yours to keep or delete.
+
+## Third-party components
+
+SV Mix includes open-source software that runs locally on your device and is
+covered by this policy:
+
+- **FFmpeg** (LGPL), used to read and write audio files.
+- **Qt / PySide6** (LGPL), used for the application interface.
+- Audio-analysis libraries including librosa, NumPy, and SciPy.
+
+None of these components are configured to make network requests in SV Mix,
+and none transmit your data. Full attribution is provided in the
+`THIRD-PARTY-NOTICES.md` file included with the app.
+
+## The Microsoft Store
+
+If you installed SV Mix from the Microsoft Store, Microsoft may collect data
+about that installation — such as your acquisition of the app, licensing,
+ratings and reviews you choose to leave, and any crash data Windows reports.
+That collection is performed by Microsoft, not by SV Mix, and is governed by
+the [Microsoft Privacy Statement](https://privacy.microsoft.com/privacystatement),
+not by this policy. We do not receive your personal data from Microsoft;
+we can see only aggregate, anonymized statistics such as total download
+counts.
+
+## Children's privacy
+
+SV Mix is suitable for general audiences and does not collect personal data
+from anyone, including children. We do not knowingly collect personal data
+from children because we do not collect personal data at all.
+
+## Security
+
+Your audio files and mixes never leave your device through SV Mix, which
+removes the risks associated with transmitting or storing data remotely.
+Files on your computer are protected by your own operating system account
+and device security.
+
+## Changes to this policy
+
+We may update this Privacy Policy if the app changes. If we ever introduce a
+feature that collects or transmits data, we will update this policy and
+raise the "Last updated" date above before that feature ships. Material
+changes will be noted in the app's Store listing.
+
+## Contact us
+
+If you have any question, concern, or complaint about privacy in SV Mix,
+contact:
+
+**jeevanbaabu03@gmail.com**
+
+We aim to respond to privacy enquiries within 30 days.

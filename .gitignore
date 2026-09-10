@@ -25,3 +25,7 @@ SVMix UI redesign brief.zip
 .DS_Store
 .vscode/
 .idea/
+
+# Bundled LGPL ffmpeg, fetched by packaging/windows/fetch_ffmpeg.ps1.
+# Large redistributable binaries — fetch them, do not commit them.
+vendor/

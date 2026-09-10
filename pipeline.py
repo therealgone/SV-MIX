@@ -12,6 +12,14 @@ import warnings
 
 import numpy as np
 import librosa
+
+import ffmpeg_support
+
+# Point pydub at the bundled LGPL ffmpeg (if this is a packaged build)
+# before importing it, so its ffmpeg/ffprobe lookup resolves there rather
+# than to whatever may or may not be on the user's PATH.
+ffmpeg_support.configure()
+
 from pydub import AudioSegment
 from pydub.utils import mediainfo
 
