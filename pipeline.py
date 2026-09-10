@@ -30,9 +30,17 @@ AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a")
 
 ANALYSIS_SR = 22050          # sample rate used for BPM/energy analysis
 ENERGY_WINDOW_SEC = 1.5      # window size for RMS energy estimation
-HOOK_TARGET_SEC = 50.0       # midpoint of the desired hook length
-HOOK_MIN_SEC = 40.0
-HOOK_MAX_SEC = 60.0
+
+# Hook/segment length is dynamic per song rather than fixed: every song's
+# kept hook is somewhere between HOOK_MIN_SEC and HOOK_MAX_SEC, with the
+# exact length driven by how strongly that song's detected section fits
+# the selected hook type relative to the other songs in the mix (see
+# _compute_dynamic_lengths). HOOK_TARGET_SEC is the scan/extraction window
+# used during analysis — it's set to the max, since trimming a segment
+# down later is easy but you can never lengthen it back up.
+HOOK_MIN_SEC = 20.0
+HOOK_MAX_SEC = 35.0
+HOOK_TARGET_SEC = HOOK_MAX_SEC
 INTRO_SKIP_FRACTION = 0.15   # ignore first 15% of the track
 OUTRO_SKIP_FRACTION = 0.10   # ignore last 10% of the track
 
@@ -52,13 +60,10 @@ MODE_LABELS = {
     MODE_ULTRA: "Ultra Mix",
 }
 
-SEGMENT_MIN_SEC = 30.0       # shortest a kept hook segment is trimmed to
-SEGMENT_MAX_SEC = 48.0       # longest — kept a couple seconds under
-                              # HOOK_TARGET_SEC (the actual detected hook
-                              # window size), since trimming can only
-                              # shorten a segment, never lengthen it
-ULTRA_CHUNK_MIN_SEC = 20.0   # shortest an Ultra Mix interleaved half is
-ULTRA_CHUNK_MAX_SEC = 25.0   # longest
+SEGMENT_MIN_SEC = HOOK_MIN_SEC   # shortest a kept hook segment is trimmed to
+SEGMENT_MAX_SEC = HOOK_MAX_SEC   # longest a kept hook segment is trimmed to
+ULTRA_CHUNK_MIN_SEC = SEGMENT_MIN_SEC / 2.0   # shortest an Ultra Mix interleaved half is
+ULTRA_CHUNK_MAX_SEC = SEGMENT_MAX_SEC / 2.0   # longest
 
 # Hook types: which part of each song gets used as the hook, independent
 # of the mix mode above.
@@ -503,6 +508,136 @@ def split_into_ultra_chunks(segment, chunk_len_sec):
     return segment[:chunk_ms], segment[chunk_ms:chunk_ms * 2]
 
 
+def _nearest_neighbor_chain(items, bpm_key, score_key, descending=False):
+    """Order items by nearest-neighbor chaining in normalized
+    (bpm, score) space, so every transition lands on whichever
+    remaining item feels closest in tempo *and* energy/brightness —
+    tighter than a plain BPM sort, since two items at the same tempo
+    can still feel very different in intensity. This is what makes the
+    crossfade between them read as a deliberate, seamless transition
+    rather than an arbitrary cut, no matter which mix mode is active.
+
+    descending=True starts the chain from the highest-BPM item instead
+    of the lowest — used to continue an ascending pass with a matching
+    "wave back down" for a later reprise section.
+    """
+    n = len(items)
+    if n <= 1:
+        return list(items)
+
+    bpms = [bpm_key(it) for it in items]
+    scores = [score_key(it) for it in items]
+    bpm_lo, bpm_hi = min(bpms), max(bpms)
+    score_lo, score_hi = min(scores), max(scores)
+    bpm_range = (bpm_hi - bpm_lo) or 1.0
+    score_range = (score_hi - score_lo) or 1.0
+    features = [
+        ((b - bpm_lo) / bpm_range, (sc - score_lo) / score_range)
+        for b, sc in zip(bpms, scores)
+    ]
+
+    remaining = list(range(n))
+    start = (max if descending else min)(remaining, key=lambda i: features[i][0])
+    order = [start]
+    remaining.remove(start)
+    while remaining:
+        cur = features[order[-1]]
+        nxt = min(
+            remaining,
+            key=lambda i: (features[i][0] - cur[0]) ** 2 + (features[i][1] - cur[1]) ** 2,
+        )
+        order.append(nxt)
+        remaining.remove(nxt)
+    return [items[i] for i in order]
+
+
+def order_by_feel(songs, score_key=lambda s: s["hooks"][0]["score"], descending=False):
+    """Order per-song dicts (see _group_by_song) so consecutive songs in
+    the final mix feel alike — similar tempo and energy — using
+    _nearest_neighbor_chain. Applied the same way regardless of mix
+    mode, since the "does the next song fit" question is universal.
+    """
+    return _nearest_neighbor_chain(
+        songs, bpm_key=lambda s: s["bpm"], score_key=score_key, descending=descending
+    )
+
+
+def _fit_ratios(songs, score_key):
+    """Normalize each song's hook score to [0, 1] relative to the other
+    songs being mixed — 1.0 is the strongest fit for the selected hook
+    type in this batch, 0.0 the weakest. All songs equal -> 0.5 each.
+    """
+    scores = [score_key(s) for s in songs]
+    lo, hi = min(scores), max(scores)
+    if hi - lo < 1e-9:
+        return [0.5] * len(songs)
+    return [(sc - lo) / (hi - lo) for sc in scores]
+
+
+def _scale_lengths_to_target(lengths, fit, target_total, min_sec, max_sec):
+    """Redistribute `lengths` (already fit-weighted, one per song) so
+    they sum to target_total, without breaking the [min_sec, max_sec]
+    bounds. Extra time is handed mostly to the highest-fit songs first,
+    since they best represent the selected hook mode; time taken away
+    comes mostly from the lowest-fit songs first. Priority order set by
+    `fit` survives the correction for the user's requested duration —
+    a low-fit song is only ever leaned on less, never dropped.
+    """
+    lengths = list(lengths)
+    n = len(lengths)
+    if n == 0:
+        return lengths
+
+    for _ in range(60):
+        diff = target_total - sum(lengths)
+        if abs(diff) < 0.05:
+            break
+        if diff > 0:
+            idxs = [i for i in range(n) if lengths[i] < max_sec - 1e-6]
+            weights = [fit[i] + 0.05 for i in idxs]
+        else:
+            idxs = [i for i in range(n) if lengths[i] > min_sec + 1e-6]
+            weights = [(1.0 - fit[i]) + 0.05 for i in idxs]
+        if not idxs:
+            break
+        wsum = sum(weights)
+        for i, w in zip(idxs, weights):
+            lengths[i] = min(max_sec, max(min_sec, lengths[i] + diff * (w / wsum)))
+    return lengths
+
+
+def _compute_dynamic_lengths(songs, target_duration_sec, score_key,
+                              min_sec=SEGMENT_MIN_SEC, max_sec=SEGMENT_MAX_SEC):
+    """Per-song hook length in [min_sec, max_sec] seconds. A song whose
+    detected hook scores higher for the selected hook type (relative to
+    the other songs in this mix) gets a length closer to max_sec; a
+    weaker match gets pulled toward min_sec — leaned on less, never
+    dropped. This is what "priority to the selected mode" means in
+    practice: the song that's most *oriented* to Kuthu/Melody/Dance/etc.
+    gets more seconds of its hook in the final mix than one that only
+    weakly qualifies.
+
+    When target_duration_sec is given, lengths are then nudged
+    (respecting the same bounds and the same priority order) so the
+    mix lands close to the user's requested overall duration.
+    """
+    n = len(songs)
+    if n == 0:
+        return []
+
+    fit = _fit_ratios(songs, score_key)
+    base_lengths = [min_sec + f * (max_sec - min_sec) for f in fit]
+
+    if target_duration_sec is None:
+        return base_lengths
+    if n == 1:
+        return [min(max(target_duration_sec, min_sec), max_sec)]
+
+    crossfade_sec = CROSSFADE_MS / 1000.0
+    target_total = target_duration_sec + (n - 1) * crossfade_sec
+    return _scale_lengths_to_target(base_lengths, fit, target_total, min_sec, max_sec)
+
+
 def _group_by_song(results):
     """Group process_files' flat per-hook results back into a list of
     per-song dicts: {"filename", "bpm", "hooks": [result, ...]}, hooks
@@ -523,29 +658,30 @@ def _group_by_song(results):
 
 
 def _plan_normal_mix(songs, target_duration_sec):
-    """Every song's main hook exactly once, length interpolated between
-    SEGMENT_MIN_SEC and SEGMENT_MAX_SEC to hit target_duration_sec.
+    """Every song's main hook exactly once, ordered by feel (tempo +
+    energy) rather than raw BPM, each given a dynamic length in
+    [SEGMENT_MIN_SEC, SEGMENT_MAX_SEC] weighted by how strongly it fits
+    the selected hook type, scaled to hit target_duration_sec overall.
     """
     n = len(songs)
     if n == 0:
         return []
 
-    crossfade_sec = CROSSFADE_MS / 1000.0
-    if n == 1:
-        segment_len = target_duration_sec
-    else:
-        segment_len = (target_duration_sec + (n - 1) * crossfade_sec) / n
-    segment_len = min(max(segment_len, SEGMENT_MIN_SEC), SEGMENT_MAX_SEC)
-
-    ordered_songs = sorted(songs, key=lambda s: s["bpm"])
-    return [trim_segment(s["hooks"][0]["segment"], segment_len) for s in ordered_songs]
+    ordered_songs = order_by_feel(songs)
+    lengths = _compute_dynamic_lengths(
+        ordered_songs, target_duration_sec, score_key=lambda s: s["hooks"][0]["score"]
+    )
+    return [
+        trim_segment(s["hooks"][0]["segment"], length)
+        for s, length in zip(ordered_songs, lengths)
+    ]
 
 
 def _plan_loop_mix(songs, target_duration_sec):
-    """Phase A: every song's main hook once, length grown from
-    SEGMENT_MIN_SEC to SEGMENT_MAX_SEC. Phase B (once phase A maxes
-    out): add reprise hooks, highest-energy song first, until the
-    target is reached.
+    """Phase A: every song's main hook once, dynamic length weighted by
+    hook-type fit within [SEGMENT_MIN_SEC, SEGMENT_MAX_SEC]. Phase B
+    (once phase A maxes out): add reprise hooks, highest-fit song
+    first, until the target is reached.
     """
     n = len(songs)
     if n == 0:
@@ -557,47 +693,66 @@ def _plan_loop_mix(songs, target_duration_sec):
         return segment_count * segment_len - max(segment_count - 1, 0) * crossfade_sec
 
     phase_a_max = total_for(n, SEGMENT_MAX_SEC)
-    ordered_songs = sorted(songs, key=lambda s: s["bpm"])
+    ordered_songs = order_by_feel(songs)
 
     if target_duration_sec <= phase_a_max or n == 1:
-        if n == 1:
-            segment_len = target_duration_sec
-        else:
-            segment_len = (target_duration_sec + (n - 1) * crossfade_sec) / n
-        segment_len = min(max(segment_len, SEGMENT_MIN_SEC), SEGMENT_MAX_SEC)
-        return [trim_segment(s["hooks"][0]["segment"], segment_len) for s in ordered_songs]
+        lengths = _compute_dynamic_lengths(
+            ordered_songs, target_duration_sec, score_key=lambda s: s["hooks"][0]["score"]
+        )
+        return [
+            trim_segment(s["hooks"][0]["segment"], length)
+            for s, length in zip(ordered_songs, lengths)
+        ]
 
-    # Phase B: mains locked at full length, reprises added one at a
-    # time (highest hook energy score first) until we reach the target.
+    # Phase B: mains locked at full length, reprises added — highest
+    # hook-type fit first — until we reach the target. Which songs to
+    # include is chosen greedily off an average length estimate; the
+    # included set's actual per-song lengths are then computed
+    # dynamically (weighted by fit) to close the remaining gap.
     mains = [trim_segment(s["hooks"][0]["segment"], SEGMENT_MAX_SEC) for s in ordered_songs]
 
     current_total = phase_a_max
     reprise_candidates = [s for s in songs if len(s["hooks"]) > 1]
     reprise_candidates.sort(key=lambda s: s["hooks"][1]["score"], reverse=True)
 
-    used_songs, extras = [], []
+    avg_len = (SEGMENT_MIN_SEC + SEGMENT_MAX_SEC) / 2.0
+    used_songs = []
     for s in reprise_candidates:
         if current_total >= target_duration_sec:
             break
-        remaining = target_duration_sec - current_total
-        segment_len = min(SEGMENT_MAX_SEC, max(remaining + crossfade_sec, SEGMENT_MIN_SEC))
-        extras.append(trim_segment(s["hooks"][1]["segment"], segment_len))
         used_songs.append(s)
-        current_total += segment_len - crossfade_sec
+        current_total += avg_len - crossfade_sec
 
-    # Reprises ordered by BPM descending: a wave back down, echoing the
-    # ascending-then-descending pass style of the original mix logic.
-    extra_pairs = sorted(zip(used_songs, extras), key=lambda pair: pair[0]["bpm"], reverse=True)
-    return mains + [seg for _, seg in extra_pairs]
+    if not used_songs:
+        return mains
+
+    # Reprises ordered by feel, starting from the high-BPM end: a wave
+    # back down, echoing the ascending-then-descending pass style of
+    # the original mix logic. Each new segment crossfades against the
+    # one before it (including the first reprise against the last
+    # main), hence the "+ crossfade_sec".
+    ordered_reprises = order_by_feel(
+        used_songs, score_key=lambda s: s["hooks"][1]["score"], descending=True
+    )
+    remaining_target = target_duration_sec - phase_a_max + crossfade_sec
+    lengths = _compute_dynamic_lengths(
+        ordered_reprises, remaining_target, score_key=lambda s: s["hooks"][1]["score"]
+    )
+    extras = [
+        trim_segment(s["hooks"][1]["segment"], length)
+        for s, length in zip(ordered_reprises, lengths)
+    ]
+    return mains + extras
 
 
 def _plan_ultra_mix(songs, target_duration_sec):
-    """Fast interleaved mashup. Phase A: every song's main hook split
-    into two ULTRA_CHUNK-length halves, played round-robin (all "A"
-    halves in BPM order, then all "B" halves) instead of finishing one
+    """Fast interleaved mashup. Phase A: every song's main hook gets a
+    dynamic length (weighted by hook-type fit, like the other modes),
+    split into two consecutive halves played round-robin (all "A"
+    halves in feel order, then all "B" halves) instead of finishing one
     song before the next. Phase B (once phase A maxes out): songs
     progressively also contribute their reprise hook, split the same
-    way and appended as two more rounds, highest-energy song first.
+    way and appended as two more rounds, highest-fit song first.
     """
     n = len(songs)
     if n == 0:
@@ -609,24 +764,31 @@ def _plan_ultra_mix(songs, target_duration_sec):
         return segment_count * segment_len - max(segment_count - 1, 0) * crossfade_sec
 
     phase_a_max = total_for(2 * n, ULTRA_CHUNK_MAX_SEC)
-    ordered_songs = sorted(songs, key=lambda s: s["bpm"])
+    ordered_songs = order_by_feel(songs)
 
     if target_duration_sec <= phase_a_max or n == 1:
         if n == 1:
-            chunk_len = target_duration_sec / 2.0
+            full_lengths = [min(max(target_duration_sec, SEGMENT_MIN_SEC), SEGMENT_MAX_SEC)]
         else:
-            chunk_len = (target_duration_sec + (2 * n - 1) * crossfade_sec) / (2 * n)
-        chunk_len = min(max(chunk_len, ULTRA_CHUNK_MIN_SEC), ULTRA_CHUNK_MAX_SEC)
+            # 2n halves total with 2n-1 internal crossfades; each
+            # song's full (pre-split) length is what _compute_dynamic_lengths
+            # weighs by fit, so the "+ n * crossfade_sec" below converts
+            # that segment-count crossfade budget into the per-song one
+            # the helper expects (n songs, n-1 crossfades).
+            adj_target = target_duration_sec + n * crossfade_sec
+            full_lengths = _compute_dynamic_lengths(
+                ordered_songs, adj_target, score_key=lambda s: s["hooks"][0]["score"]
+            )
 
         halves_a, halves_b = [], []
-        for s in ordered_songs:
-            a, b = split_into_ultra_chunks(s["hooks"][0]["segment"], chunk_len)
+        for s, length in zip(ordered_songs, full_lengths):
+            a, b = split_into_ultra_chunks(s["hooks"][0]["segment"], length / 2.0)
             halves_a.append(a)
             halves_b.append(b)
         return halves_a + halves_b
 
     # Phase B: main hooks locked at max chunk length, reprise chunk-pairs
-    # added one song at a time (highest energy first) until target is reached.
+    # added — highest hook-type fit first — until target is reached.
     halves_a, halves_b = [], []
     for s in ordered_songs:
         a, b = split_into_ultra_chunks(s["hooks"][0]["segment"], ULTRA_CHUNK_MAX_SEC)
@@ -637,24 +799,32 @@ def _plan_ultra_mix(songs, target_duration_sec):
     reprise_candidates = [s for s in songs if len(s["hooks"]) > 1]
     reprise_candidates.sort(key=lambda s: s["hooks"][1]["score"], reverse=True)
 
-    used_songs, extra_a, extra_b = [], [], []
+    avg_chunk = (ULTRA_CHUNK_MIN_SEC + ULTRA_CHUNK_MAX_SEC) / 2.0
+    used_songs = []
     for s in reprise_candidates:
         if current_total >= target_duration_sec:
             break
-        remaining = target_duration_sec - current_total
-        chunk_len = remaining / 2.0 + crossfade_sec
-        chunk_len = min(max(chunk_len, ULTRA_CHUNK_MIN_SEC), ULTRA_CHUNK_MAX_SEC)
-        a, b = split_into_ultra_chunks(s["hooks"][1]["segment"], chunk_len)
         used_songs.append(s)
+        current_total += 2 * avg_chunk - 2 * crossfade_sec
+
+    if not used_songs:
+        return halves_a + halves_b
+
+    ordered_reprises = order_by_feel(
+        used_songs, score_key=lambda s: s["hooks"][1]["score"], descending=True
+    )
+    m = len(ordered_reprises)
+    remaining_target = target_duration_sec - phase_a_max
+    adj_target = remaining_target + (m + 1) * crossfade_sec
+    reprise_lengths = _compute_dynamic_lengths(
+        ordered_reprises, adj_target, score_key=lambda s: s["hooks"][1]["score"]
+    )
+
+    extra_a, extra_b = [], []
+    for s, length in zip(ordered_reprises, reprise_lengths):
+        a, b = split_into_ultra_chunks(s["hooks"][1]["segment"], length / 2.0)
         extra_a.append(a)
         extra_b.append(b)
-        current_total += 2 * chunk_len - 2 * crossfade_sec
-
-    extra_triples = sorted(
-        zip(used_songs, extra_a, extra_b), key=lambda t: t[0]["bpm"], reverse=True
-    )
-    extra_a = [a for _, a, _ in extra_triples]
-    extra_b = [b for _, _, b in extra_triples]
 
     return halves_a + halves_b + extra_a + extra_b
 
@@ -737,20 +907,27 @@ def process_files(filepaths, mode=MODE_LOOP, target_duration_sec=None, hook_type
             "total_hooks": 0,
         }
 
-    report("Sorting by BPM...", 85)
+    report("Ordering by feel...", 85)
 
     if target_duration_sec is None:
         # Original, mode-agnostic behavior: use every available hook
         # (main + reprise) for every song. Group entries into passes by
         # variation index: pass 0 is every song's main hook, pass 1 is
-        # the reprise for songs that have one. Alternate sort direction
-        # each pass (ascending, then descending) so the tempo ramps up
-        # then back down like a wave.
+        # the reprise for songs that have one. Each pass is chained by
+        # tempo+energy feel rather than raw BPM, alternating direction
+        # (ascending, then descending) so the mix ramps up then back
+        # down like a wave, with every hand-off landing on whichever
+        # remaining song feels closest to the one before it.
         max_variation = max(r["variation"] for r in results)
         ordered = []
         for pass_idx in range(max_variation + 1):
             pass_entries = [r for r in results if r["variation"] == pass_idx]
-            pass_entries.sort(key=lambda r: r["bpm"], reverse=(pass_idx % 2 == 1))
+            pass_entries = _nearest_neighbor_chain(
+                pass_entries,
+                bpm_key=lambda r: r["bpm"],
+                score_key=lambda r: r["score"],
+                descending=(pass_idx % 2 == 1),
+            )
             ordered.extend(pass_entries)
         hooks = [r["segment"] for r in ordered]
     else:

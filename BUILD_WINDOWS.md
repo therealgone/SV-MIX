@@ -111,3 +111,76 @@ listed in "Add or Remove Programs".
   source is openly available, this satisfies LGPL's terms — no separate
   action needed, just don't switch to a statically-linked Qt build without
   re-checking the license implications.
+
+## 6. Packaging for the Microsoft Store (MSIX)
+
+The `Setup.exe` from step 4 is a normal Win32 installer — fine to hand out
+directly, but the Store wants an **MSIX** package. The easiest way to get
+one is Microsoft's own **MSIX Packaging Tool**, which wraps your existing
+installer without needing any code changes.
+
+### One-time setup
+
+1. Create a developer account at
+   [Partner Center](https://partner.microsoft.com/dashboard) (one-time fee:
+   ~$19 individual / ~$99 company) and reserve your app name (e.g.
+   "SVMixer") under **Apps and Games → New product**. Reserving the name
+   generates the **Package/Identity/Name** and **Publisher** values you'll
+   need below — Partner Center shows them on the app's *Product identity*
+   page, and they must match exactly or the Store submission will be
+   rejected.
+2. Install the **MSIX Packaging Tool**:
+   ```powershell
+   winget install 9N5LW3JBCXKF
+   ```
+   (or search "MSIX Packaging Tool" in the Microsoft Store app).
+3. Microsoft's own recommendation is to run the capture step on a **clean
+   Windows machine or VM** (no other software installed) so the tool only
+   picks up files/registry changes SVMixer's installer actually makes —
+   doing it on your regular dev machine works too, just double-check the
+   captured file list in step 4 below and remove anything unrelated.
+
+### Capture the package
+
+1. Build `Setup.exe` first (steps 1–4 above) if you haven't already.
+2. Open **MSIX Packaging Tool** → **Application package** → **On this
+   computer**.
+3. Point it at `dist\installer\SVMixer-Setup-1.0.0.exe` and let it run —
+   click through your installer's normal install wizard as it launches.
+4. Once installed, the tool asks you to launch SVMixer once (so it can
+   confirm the app's entry point), then click **Next** to finish capturing.
+5. On the **Package information** screen, fill in the **Package
+   name**/**Publisher**/**Publisher display name** fields with the exact
+   values from Partner Center's *Product identity* page, then set a
+   **Package version** (e.g. `1.0.0.0` — MSIX requires 4 dotted parts,
+   unlike the installer's 3-part version).
+6. Finish the wizard — it writes a `.msix` (or `.msixbundle` if it
+   detected multiple architectures) file.
+
+### Test it locally before submitting
+
+MSIX packages need a trusted signing certificate to install outside the
+Store. The packaging tool self-signs the package with a test certificate
+during capture; to sideload it locally:
+
+```powershell
+# one-time: trust the tool's test certificate (path shown by the tool
+# after capture, typically ends in .cer)
+Import-Certificate -FilePath ".\SVMixer.cer" -CertStoreLocation Cert:\LocalMachine\TrustedPeople
+
+# install the package
+Add-AppxPackage -Path ".\SVMixer.msix"
+```
+
+If it launches correctly from the Start Menu, it's ready to submit.
+
+### Submit to the Store
+
+Upload the `.msix`/`.msixbundle` on your app's Partner Center *Packages*
+page. **You don't need a "real" (paid) code-signing certificate for this
+step** — Microsoft re-signs the package with its own Store certificate
+during certification, so the test-signed file from the packaging tool is
+fine to upload as-is. Partner Center also requires separate Store-listing
+assets at this stage (description, screenshots, a square icon, etc.) —
+those are configured entirely in the Partner Center dashboard, not part
+of this repo.
