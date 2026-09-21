@@ -37,7 +37,17 @@ EXPORT_BITRATE = "320k"
 AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a")
 
 ANALYSIS_SR = 22050          # sample rate used for BPM/energy analysis
-ENERGY_WINDOW_SEC = 1.5      # window size for RMS energy estimation
+ENERGY_WINDOW_SEC = 1.0      # window size for RMS energy estimation; also
+                              # sets the step size hook-window scanning
+                              # slides by, so smaller = finer-grained hook
+                              # placement (at some extra analysis cost)
+
+# How many seconds around a candidate window's own position to exclude
+# when scoring it for "repetition" (see compute_repetition_strength) --
+# a window always looks similar to its immediate neighbors just from
+# audio continuity, which isn't the same thing as the section recurring
+# elsewhere in the song (e.g. the chorus coming back later).
+REPETITION_NEIGHBOR_SEC = 6.0
 
 # Hook/segment length is dynamic per song rather than fixed: every song's
 # kept hook is somewhere between HOOK_MIN_SEC and HOOK_MAX_SEC, with the
@@ -162,6 +172,34 @@ def compute_spectral_centroid(y, sr, window_sec=ENERGY_WINDOW_SEC):
     return centroid
 
 
+def compute_repetition_strength(y, sr, times, window_sec=ENERGY_WINDOW_SEC):
+    """Score each window (aligned with `times`) by how much its harmonic
+    content recurs elsewhere in the song, using a chroma self-similarity
+    (recurrence) matrix -- the same idea behind "chorus detection" /
+    audio thumbnailing. A section that comes back multiple times (the
+    chorus/hook) scores higher than a loud one-off moment (e.g. a bridge
+    or instrumental break) that happens to have similar energy.
+
+    Returns an array aligned with `times`; all zeros if the song is too
+    short for the self-similarity matrix to be meaningful.
+    """
+    hop_length = max(int(sr * window_sec), 1)
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
+    n = min(chroma.shape[1], len(times))
+    if n < 4:
+        return np.zeros(len(times))
+
+    band = max(int(round(REPETITION_NEIGHBOR_SEC / window_sec)), 1)
+    recurrence = librosa.segment.recurrence_matrix(
+        chroma[:, :n], width=band, sym=True, mode="affinity"
+    )
+    strength = np.asarray(recurrence.sum(axis=1)).flatten()
+
+    full = np.zeros(len(times))
+    full[:n] = strength
+    return full
+
+
 def compute_local_tempo(times, y, sr):
     """Compute a local (short-time) tempo estimate for each window in
     `times` (the same grid produced by compute_rms_energy), by taking
@@ -191,7 +229,8 @@ def compute_local_tempo(times, y, sr):
 
 
 def find_typed_hook_windows(
-    times, rms, centroid, duration, hook_type, num_windows=HOOKS_PER_SONG, local_tempo=None
+    times, rms, centroid, duration, hook_type, num_windows=HOOKS_PER_SONG,
+    local_tempo=None, repetition=None
 ):
     """Like find_top_hook_windows, but ranks candidate windows by a
     combined energy+brightness score instead of energy alone, and can
@@ -204,6 +243,14 @@ def find_typed_hook_windows(
     using `local_tempo`, an array aligned with `times`/`rms`). score is
     always stored so "higher = more preferred" holds for every type
     (melody scores are the inverted combined score).
+
+    `repetition`, if given (see compute_repetition_strength, aligned with
+    `times`/`rms`), nudges HOOK_TYPE_DANCE/HOOK_TYPE_KUTHU toward
+    sections that recur elsewhere in the song (the chorus/hook proper)
+    rather than a merely loud/fast one-off moment. Not applied to melody:
+    the "calm section" melody is looking for is often a verse/bridge that
+    deliberately *doesn't* repeat as much as the chorus, so biasing
+    toward repetition there would work against the point of that mode.
     """
     valid_start = duration * INTRO_SKIP_FRACTION
     valid_end = duration * (1.0 - OUTRO_SKIP_FRACTION)
@@ -245,6 +292,12 @@ def find_typed_hook_windows(
         c_min, c_max = float(np.min(valid_centroid)), float(np.max(valid_centroid))
         c_range = c_max - c_min or 1.0
 
+    use_repetition = repetition is not None and hook_type in (HOOK_TYPE_KUTHU, HOOK_TYPE_DANCE)
+    if use_repetition:
+        valid_repetition = repetition[valid_indices]
+        rep_min, rep_max = float(np.min(valid_repetition)), float(np.max(valid_repetition))
+        rep_range = rep_max - rep_min or 1.0
+
     rms_floor = None
     if hook_type == HOOK_TYPE_MELODY:
         rms_floor = float(np.percentile(valid_rms, MELODY_RMS_FLOOR_PERCENTILE))
@@ -264,7 +317,15 @@ def find_typed_hook_windows(
             # Energy-weighted: a loud, relentless section counts as much
             # as raw tempo, since that's what actually reads as "hype"
             # for this genre — tempo alone under- and over-shoots badly.
-            combined = 0.65 * norm_rms + 0.35 * norm_tempo
+            if use_repetition:
+                avg_rep = float(np.mean(repetition[idx:end_idx]))
+                norm_rep = (avg_rep - rep_min) / rep_range
+                # Repetition gets real weight but doesn't dominate: a
+                # loud, fast, *recurring* section is what "the kuthu
+                # part" means, not just whichever moment repeats most.
+                combined = 0.5 * norm_rms + 0.2 * norm_tempo + 0.3 * norm_rep
+            else:
+                combined = 0.65 * norm_rms + 0.35 * norm_tempo
         elif hook_type == HOOK_TYPE_MELODY:
             if avg_rms < rms_floor:
                 continue
@@ -284,7 +345,12 @@ def find_typed_hook_windows(
         else:  # HOOK_TYPE_DANCE
             avg_centroid = float(np.mean(centroid[idx:end_idx]))
             norm_centroid = (avg_centroid - c_min) / c_range
-            combined = 0.5 * norm_rms + 0.5 * norm_centroid
+            if use_repetition:
+                avg_rep = float(np.mean(repetition[idx:end_idx]))
+                norm_rep = (avg_rep - rep_min) / rep_range
+                combined = 0.35 * norm_rms + 0.35 * norm_centroid + 0.3 * norm_rep
+            else:
+                combined = 0.5 * norm_rms + 0.5 * norm_centroid
 
         candidates.append((combined, idx, end_idx))
 
@@ -408,8 +474,10 @@ def analyze_track(audio, hook_type=HOOK_TYPE_NORMAL):
         raw_windows = find_top_hook_windows(times, rms, duration)
     elif hook_type == HOOK_TYPE_KUTHU:
         local_tempo = compute_local_tempo(times, y, sr)
+        repetition = compute_repetition_strength(y, sr, times)
         raw_windows = find_typed_hook_windows(
-            times, rms, None, duration, hook_type, local_tempo=local_tempo
+            times, rms, None, duration, hook_type,
+            local_tempo=local_tempo, repetition=repetition
         )
     elif hook_type == HOOK_TYPE_MELODY:
         centroid = compute_spectral_centroid(y, sr)
@@ -419,7 +487,10 @@ def analyze_track(audio, hook_type=HOOK_TYPE_NORMAL):
         )
     else:
         centroid = compute_spectral_centroid(y, sr)
-        raw_windows = find_typed_hook_windows(times, rms, centroid, duration, hook_type)
+        repetition = compute_repetition_strength(y, sr, times)
+        raw_windows = find_typed_hook_windows(
+            times, rms, centroid, duration, hook_type, repetition=repetition
+        )
 
     hooks = []
     for raw_start, raw_end, score in raw_windows:
@@ -428,7 +499,19 @@ def analyze_track(audio, hook_type=HOOK_TYPE_NORMAL):
         # Guard against snapping collapsing the window or reversing order.
         if hook_end <= hook_start:
             hook_end = min(hook_start + HOOK_MIN_SEC, duration)
-        hooks.append({"hook_start": hook_start, "hook_end": hook_end, "score": score})
+        # Beats that fall inside this hook, as offsets from the hook's own
+        # start -- lets a later dynamic-length trim (_compute_dynamic_lengths
+        # / trim_segment_to_beat) cut the segment down on a downbeat instead
+        # of at an arbitrary millisecond.
+        beat_offsets = [
+            float(t - hook_start) for t in beat_times if hook_start <= t <= hook_end
+        ]
+        hooks.append({
+            "hook_start": hook_start,
+            "hook_end": hook_end,
+            "score": score,
+            "beat_offsets": beat_offsets,
+        })
 
     return {
         "bpm": bpm,
@@ -514,6 +597,69 @@ def split_into_ultra_chunks(segment, chunk_len_sec):
     if chunk_ms * 2 > available:
         chunk_ms = max(available // 2, 1)
     return segment[:chunk_ms], segment[chunk_ms:chunk_ms * 2]
+
+
+# How far (seconds) a dynamically-shortened hook's cut point is allowed to
+# drift from the requested length in order to land on a beat instead.
+# Beyond this, hitting the user's requested duration matters more than
+# landing exactly on a downbeat, so it falls back to a plain cut.
+TRIM_BEAT_SNAP_TOLERANCE_SEC = 1.5
+
+
+def _nearest_beat_sec(target_sec, beat_offsets, tolerance_sec=TRIM_BEAT_SNAP_TOLERANCE_SEC):
+    """Return the beat offset (seconds, relative to a hook's own start --
+    see analyze_track) closest to target_sec, or None if none fall within
+    tolerance_sec of it.
+    """
+    if not beat_offsets:
+        return None
+    candidates = [b for b in beat_offsets if abs(b - target_sec) <= tolerance_sec]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda b: abs(b - target_sec))
+
+
+def trim_segment_to_beat(segment, target_len_sec, beat_offsets=None):
+    """Like trim_segment, but snaps the cut point to the nearest beat
+    inside the segment (beat_offsets: seconds relative to the segment's
+    own start, from analyze_track) instead of an arbitrary millisecond --
+    a dynamically-shortened hook then still ends on a downbeat rather
+    than mid-phrase. Falls back to a plain trim if no beat lands close
+    enough to the requested length.
+    """
+    target_ms = int(target_len_sec * 1000)
+    if target_ms <= 0 or target_ms >= len(segment):
+        return segment
+    nearest = _nearest_beat_sec(target_len_sec, beat_offsets)
+    if nearest is None:
+        return segment[:target_ms]
+    nearest_ms = int(nearest * 1000)
+    if nearest_ms <= 0 or nearest_ms >= len(segment):
+        return segment[:target_ms]
+    return segment[:nearest_ms]
+
+
+def split_into_ultra_chunks_to_beat(segment, chunk_len_sec, beat_offsets=None):
+    """Beat-aware version of split_into_ultra_chunks: the boundary between
+    the two halves (and the end of the second half) each snap to the
+    nearest beat within tolerance, same rationale as trim_segment_to_beat.
+    """
+    available = len(segment)
+    chunk_ms = int(chunk_len_sec * 1000)
+    if chunk_ms * 2 > available:
+        chunk_ms = max(available // 2, 1)
+
+    split_sec = chunk_ms / 1000.0
+    nearest_split = _nearest_beat_sec(split_sec, beat_offsets)
+    split_ms = int(nearest_split * 1000) if nearest_split is not None else chunk_ms
+    split_ms = max(1, min(split_ms, available - 1))
+
+    end_sec = (2 * chunk_ms) / 1000.0
+    nearest_end = _nearest_beat_sec(end_sec, beat_offsets)
+    end_ms = int(nearest_end * 1000) if nearest_end is not None else 2 * chunk_ms
+    end_ms = max(split_ms + 1, min(end_ms, available))
+
+    return segment[:split_ms], segment[split_ms:end_ms]
 
 
 def _nearest_neighbor_chain(items, bpm_key, score_key, descending=False):
@@ -680,7 +826,7 @@ def _plan_normal_mix(songs, target_duration_sec):
         ordered_songs, target_duration_sec, score_key=lambda s: s["hooks"][0]["score"]
     )
     return [
-        trim_segment(s["hooks"][0]["segment"], length)
+        trim_segment_to_beat(s["hooks"][0]["segment"], length, s["hooks"][0].get("beat_offsets"))
         for s, length in zip(ordered_songs, lengths)
     ]
 
@@ -708,7 +854,7 @@ def _plan_loop_mix(songs, target_duration_sec):
             ordered_songs, target_duration_sec, score_key=lambda s: s["hooks"][0]["score"]
         )
         return [
-            trim_segment(s["hooks"][0]["segment"], length)
+            trim_segment_to_beat(s["hooks"][0]["segment"], length, s["hooks"][0].get("beat_offsets"))
             for s, length in zip(ordered_songs, lengths)
         ]
 
@@ -717,7 +863,10 @@ def _plan_loop_mix(songs, target_duration_sec):
     # include is chosen greedily off an average length estimate; the
     # included set's actual per-song lengths are then computed
     # dynamically (weighted by fit) to close the remaining gap.
-    mains = [trim_segment(s["hooks"][0]["segment"], SEGMENT_MAX_SEC) for s in ordered_songs]
+    mains = [
+        trim_segment_to_beat(s["hooks"][0]["segment"], SEGMENT_MAX_SEC, s["hooks"][0].get("beat_offsets"))
+        for s in ordered_songs
+    ]
 
     current_total = phase_a_max
     reprise_candidates = [s for s in songs if len(s["hooks"]) > 1]
@@ -747,7 +896,7 @@ def _plan_loop_mix(songs, target_duration_sec):
         ordered_reprises, remaining_target, score_key=lambda s: s["hooks"][1]["score"]
     )
     extras = [
-        trim_segment(s["hooks"][1]["segment"], length)
+        trim_segment_to_beat(s["hooks"][1]["segment"], length, s["hooks"][1].get("beat_offsets"))
         for s, length in zip(ordered_reprises, lengths)
     ]
     return mains + extras
@@ -790,7 +939,9 @@ def _plan_ultra_mix(songs, target_duration_sec):
 
         halves_a, halves_b = [], []
         for s, length in zip(ordered_songs, full_lengths):
-            a, b = split_into_ultra_chunks(s["hooks"][0]["segment"], length / 2.0)
+            a, b = split_into_ultra_chunks_to_beat(
+                s["hooks"][0]["segment"], length / 2.0, s["hooks"][0].get("beat_offsets")
+            )
             halves_a.append(a)
             halves_b.append(b)
         return halves_a + halves_b
@@ -799,7 +950,9 @@ def _plan_ultra_mix(songs, target_duration_sec):
     # added — highest hook-type fit first — until target is reached.
     halves_a, halves_b = [], []
     for s in ordered_songs:
-        a, b = split_into_ultra_chunks(s["hooks"][0]["segment"], ULTRA_CHUNK_MAX_SEC)
+        a, b = split_into_ultra_chunks_to_beat(
+            s["hooks"][0]["segment"], ULTRA_CHUNK_MAX_SEC, s["hooks"][0].get("beat_offsets")
+        )
         halves_a.append(a)
         halves_b.append(b)
 
@@ -830,7 +983,9 @@ def _plan_ultra_mix(songs, target_duration_sec):
 
     extra_a, extra_b = [], []
     for s, length in zip(ordered_reprises, reprise_lengths):
-        a, b = split_into_ultra_chunks(s["hooks"][1]["segment"], length / 2.0)
+        a, b = split_into_ultra_chunks_to_beat(
+            s["hooks"][1]["segment"], length / 2.0, s["hooks"][1].get("beat_offsets")
+        )
         extra_a.append(a)
         extra_b.append(b)
 
@@ -900,6 +1055,7 @@ def process_files(filepaths, mode=MODE_LOOP, target_duration_sec=None, hook_type
                     "segment": segment,
                     "variation": variation,
                     "score": hook["score"],
+                    "beat_offsets": hook.get("beat_offsets", []),
                 })
             processed_filenames.append(filename)
         except Exception as e:

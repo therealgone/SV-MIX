@@ -30,8 +30,8 @@ MODE_DESCRIPTIONS = {
 HOOK_TYPE_DESCRIPTIONS = {
     pipeline.HOOK_TYPE_NORMAL: "The loudest section of each song.",
     pipeline.HOOK_TYPE_MELODY: "The calmer, quieter section of each song. Songs with no distinct calm section are skipped.",
-    pipeline.HOOK_TYPE_DANCE: "The loudest and most upbeat section of each song. Songs with no distinct energetic section are skipped.",
-    pipeline.HOOK_TYPE_KUTHU: "The loudest, fastest-tempo section of each song. Songs with no genuinely fast-paced section are skipped.",
+    pipeline.HOOK_TYPE_DANCE: "The loudest, most upbeat, and most-repeated section of each song. Songs with no distinct energetic section are skipped.",
+    pipeline.HOOK_TYPE_KUTHU: "The loudest, fastest-tempo section that also recurs in the song — not just a one-off loud moment. Songs with no genuinely fast-paced section are skipped.",
 }
 
 _MODE_OPTIONS = [
