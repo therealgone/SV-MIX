@@ -32,6 +32,20 @@ script, both built on the same analysis engine (`pipeline.py`).
   - **Rock-Dance Hook** — the loudest *and* brightest ("drop"-like) section.
   - **Kuthu Dance Hook** — the loudest, fastest-paced section, tuned for
     high-energy Tamil "kuthu"/mass-dance style tracks.
+- **MP3 or MP4 mixes.** Switch the session to **MP4** to mix music videos
+  (`.mp4` / `.mkv` / `.mov` / `.webm`) instead of audio. Each video's
+  soundtrack is analyzed exactly like an audio file, and the picture is cut
+  at the same beat-snapped points and crossfaded along with the sound, into
+  one landscape 1080p, 30 fps `.mp4`. Video mixes are always Normal Mix
+  (each clip 25–45 s, so cuts read as scenes rather than jump cuts); all
+  four hook types apply.
+- **Locked tracks.** Tick a track in the list to always use it. If it has no
+  section matching the selected hook type, its closest-matching section is
+  used instead of skipping it. Works for both MP3 and MP4 mixes.
+- **Pre-cut tracks.** Already cut a song down to the part you want yourself?
+  Tick **Pre-cut** on it: the whole file goes into the mix exactly as it is
+  (no hook detection, no trimming), still crossfaded and placed by tempo
+  among the others, whose lengths adjust around it.
 - **Live preview** of the finished mix before saving, with a clear list of
   any songs that were skipped and why.
 - **Fully offline** — all analysis and audio processing happens locally.
@@ -90,6 +104,10 @@ Drop audio files into a `songs/` folder next to `mashup.py` (or edit the
 ```bash
 python mashup.py
 ```
+
+Add `--video` to mix the video files in the folder into
+`output/party_mix.mp4` instead, and `--hook melody|dance|kuthu` to pick a
+hook type.
 
 The mix is written to `output/party_mix.mp3`, using every available hook
 for every song (main hook + reprise), ordered by BPM. Progress prints to

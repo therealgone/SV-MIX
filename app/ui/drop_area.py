@@ -1,4 +1,4 @@
-"""Drag-and-drop + click-to-browse area for adding audio files."""
+"""Drag-and-drop + click-to-browse area for adding audio or video files."""
 
 import os
 
@@ -11,8 +11,9 @@ from . import theme
 
 
 class DropArea(QFrame):
-    """A prominent drop zone. Accepts dragged-in audio files and is
-    also clickable to open the native file browser.
+    """A prominent drop zone. Accepts dragged-in audio (or, in video
+    mode, video) files and is also clickable to open the native file
+    browser.
     """
 
     files_selected = Signal(list)  # list[str] of file paths
@@ -23,6 +24,7 @@ class DropArea(QFrame):
         self.setObjectName("dropArea")
         self.setFixedHeight(104)
         self.setCursor(Qt.PointingHandCursor)
+        self._media_type = pipeline.MEDIA_AUDIO
 
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
@@ -32,11 +34,11 @@ class DropArea(QFrame):
         icon_label.setAlignment(Qt.AlignCenter)
         icon_label.setStyleSheet(f"font-size: 22px; color: {theme.ACCENT};")
 
-        title_label = QLabel("Drop audio here")
+        self.title_label = title_label = QLabel("Drop audio here")
         title_label.setAlignment(Qt.AlignCenter)
         title_label.setObjectName("dropTitle")
 
-        subtitle_label = QLabel("or click to browse  ·  mp3  wav  m4a")
+        self.subtitle_label = subtitle_label = QLabel("or click to browse  ·  mp3  wav  m4a")
         subtitle_label.setAlignment(Qt.AlignCenter)
         subtitle_label.setObjectName("dropSubtitle")
 
@@ -65,14 +67,26 @@ class DropArea(QFrame):
             }}
         """)
 
+    def set_media_type(self, media_type):
+        self._media_type = media_type
+        exts = "  ".join(e.lstrip(".") for e in pipeline.MEDIA_EXTENSIONS[media_type])
+        noun = "video" if media_type == pipeline.MEDIA_VIDEO else "audio"
+        self.title_label.setText(f"Drop {noun} here")
+        self.subtitle_label.setText(f"or click to browse  ·  {exts}")
+
+    def _extensions(self):
+        return pipeline.MEDIA_EXTENSIONS[self._media_type]
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self._browse()
         super().mousePressEvent(event)
 
     def _browse(self):
-        filters = "Audio Files (*.mp3 *.wav *.m4a)"
-        paths, _ = QFileDialog.getOpenFileNames(self, "Select audio files", "", filters)
+        noun = "Video" if self._media_type == pipeline.MEDIA_VIDEO else "Audio"
+        patterns = " ".join(f"*{e}" for e in self._extensions())
+        filters = f"{noun} Files ({patterns})"
+        paths, _ = QFileDialog.getOpenFileNames(self, f"Select {noun.lower()} files", "", filters)
         if paths:
             self.files_selected.emit(paths)
 
@@ -88,12 +102,11 @@ class DropArea(QFrame):
             self.files_selected.emit(paths)
         event.acceptProposedAction()
 
-    @staticmethod
-    def _valid_local_paths(urls):
+    def _valid_local_paths(self, urls):
         paths = []
         for url in urls:
             if url.isLocalFile():
                 path = url.toLocalFile()
-                if os.path.splitext(path)[1].lower() in pipeline.AUDIO_EXTENSIONS:
+                if os.path.splitext(path)[1].lower() in self._extensions():
                     paths.append(path)
         return paths

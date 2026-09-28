@@ -4,7 +4,8 @@ screen, matching the SVMix redesign's isRunning / isReady split."""
 
 from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QListWidget, QVBoxLayout, QWidget
+from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QListWidget, QStackedWidget, QVBoxLayout, QWidget
 
 from . import theme
 from .widgets import ClickableLabel, ProgressRing
@@ -41,7 +42,13 @@ class StudioScreen(QWidget):
         outer.setContentsMargins(56, theme.SPACE_8, 56, theme.SPACE_8)
         outer.setSpacing(theme.SPACE_8)
 
-        outer.addWidget(self._build_ring(), 0, Qt.AlignVCenter)
+        # Left column: the progress ring (and audio play button) while
+        # mixing / for an audio result, or the video preview for a video one.
+        self.left_stack = QStackedWidget()
+        self.left_stack.addWidget(self._build_ring())
+        self.left_stack.addWidget(self._build_video_preview())
+        self._show_left_page(0)
+        outer.addWidget(self.left_stack, 0, Qt.AlignVCenter)
         outer.addWidget(self._build_info_panel(), 1)
 
         self._set_running_visible(True)
@@ -87,6 +94,40 @@ class StudioScreen(QWidget):
         )
         self.play_button.clicked.connect(self._toggle_playback)
 
+        return wrap
+
+    def _show_left_page(self, index):
+        page = self.left_stack.widget(index)
+        self.left_stack.setCurrentIndex(index)
+        self.left_stack.setFixedSize(page.size())
+
+    def _build_video_preview(self):
+        wrap = QWidget()
+        wrap.setFixedSize(400, 290)
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(theme.SPACE_4)
+
+        self.video_widget = QVideoWidget()
+        self.video_widget.setFixedSize(400, 225)
+        self.video_widget.setStyleSheet("background: black;")
+        self._player.setVideoOutput(self.video_widget)
+        layout.addWidget(self.video_widget)
+
+        self.video_play_button = ClickableLabel("▶")
+        self.video_play_button.setFixedSize(52, 52)
+        self.video_play_button.setAlignment(Qt.AlignCenter)
+        self.video_play_button.setStyleSheet(
+            f"""
+            border: 1px solid {theme.ACCENT};
+            border-radius: 26px;
+            font-size: 20px;
+            color: {theme.ACCENT};
+            background: transparent;
+            """
+        )
+        self.video_play_button.clicked.connect(self._toggle_playback)
+        layout.addWidget(self.video_play_button, 0, Qt.AlignHCenter)
         return wrap
 
     # ------------------------------------------------------------------
@@ -233,7 +274,7 @@ class StudioScreen(QWidget):
     # State transitions
     # ------------------------------------------------------------------
 
-    def start(self, mode_label, hook_label, minutes_target, n_tracks):
+    def start(self, mode_label, hook_label, length_label, n_tracks):
         self.ring.set_percent(0)
         self.percent_label.setText("0%")
         self.kicker_label.setText("WORKING")
@@ -241,11 +282,12 @@ class StudioScreen(QWidget):
         self.status_label.setText("Starting…")
         self.chip_mode.setText(mode_label)
         self.chip_hook.setText(f"{hook_label} hook")
-        self.chip_length.setText(f"{minutes_target} min target")
+        self.chip_length.setText(f"{length_label} target")
         self.chip_tracks.setText(f"{n_tracks} of {n_tracks} tracks")
         self.skipped_panel.setVisible(False)
         self.skipped_list.clear()
         self._n_tracks = n_tracks
+        self._show_left_page(0)
         self._set_running_visible(True)
 
     def set_progress(self, message, percent):
@@ -253,15 +295,28 @@ class StudioScreen(QWidget):
         self.percent_label.setText(f"{percent}%")
         self.status_label.setText(message)
 
-    def set_result(self, preview_path, duration_seconds, skipped, n_tracks):
+    def set_result(self, preview_path, duration_seconds, skipped, n_tracks,
+                   is_video=False, closest_match=()):
         self._player.stop()
         self._player.setSource(QUrl())  # force-release any previous media
         self._player.setSource(QUrl.fromLocalFile(preview_path))
         self.play_button.setText("▶")
+        self.video_play_button.setText("▶")
+        self._show_left_page(1 if is_video else 0)
 
         self.kicker_label.setText("RESULT")
         self.title_label.setText(f"Mix ready — {format_duration(duration_seconds)}")
-        self.status_label.setText("Rendered at 320 kbps. Preview it here, then save the file.")
+        status = (
+            "Rendered at 1080p. Preview it here, then save the file."
+            if is_video
+            else "Rendered at 320 kbps. Preview it here, then save the file."
+        )
+        if closest_match:
+            names = ", ".join(closest_match)
+            status += (
+                f"\nLocked tracks with no matching hook, used at their closest section: {names}"
+            )
+        self.status_label.setText(status)
 
         n_used = n_tracks - len(skipped)
         self.chip_tracks.setText(f"{n_used} of {n_tracks} used")
@@ -303,11 +358,14 @@ class StudioScreen(QWidget):
             self._player.play()
 
     def _on_playback_state_changed(self, state):
-        self.play_button.setText("⏸" if state == QMediaPlayer.PlayingState else "▶")
+        icon = "⏸" if state == QMediaPlayer.PlayingState else "▶"
+        self.play_button.setText(icon)
+        self.video_play_button.setText(icon)
 
     def _on_player_error(self, error, error_string):
         if error != QMediaPlayer.NoError:
             self.play_button.setText("▶")
+            self.video_play_button.setText("▶")
 
     def _on_new_mix_clicked(self):
         self._player.stop()
@@ -315,3 +373,8 @@ class StudioScreen(QWidget):
 
     def stop_playback(self):
         self._player.stop()
+
+    def release_media(self):
+        """Stop and let go of the preview file, so it can be deleted."""
+        self._player.stop()
+        self._player.setSource(QUrl())

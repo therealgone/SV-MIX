@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QVBoxLayout,
     QWidget,
 )
@@ -33,6 +34,17 @@ HOOK_TYPE_DESCRIPTIONS = {
     pipeline.HOOK_TYPE_DANCE: "The loudest, most upbeat, and most-repeated section of each song. Songs with no distinct energetic section are skipped.",
     pipeline.HOOK_TYPE_KUTHU: "The loudest, fastest-tempo section that also recurs in the song — not just a one-off loud moment. Songs with no genuinely fast-paced section are skipped.",
 }
+
+VIDEO_MODE_DESCRIPTION = (
+    "Video mixes are always Normal Mix — every video is used once, each cut "
+    f"{pipeline.VIDEO_SEGMENT_MIN_SEC:.0f}–{pipeline.VIDEO_SEGMENT_MAX_SEC:.0f} seconds "
+    "so it still reads as a scene, not a jump cut."
+)
+
+_MEDIA_OPTIONS = [
+    (pipeline.MEDIA_AUDIO, "MP3"),
+    (pipeline.MEDIA_VIDEO, "MP4"),
+]
 
 _MODE_OPTIONS = [
     (pipeline.MODE_NORMAL, "Normal Mix"),
@@ -66,15 +78,18 @@ def _kicker_style():
 
 
 class SetupScreen(QWidget):
-    # (filepaths, mode, target_duration_sec, hook_type)
-    mix_requested = Signal(list, str, int, str)
+    # (filepaths, mode, target_duration_sec, hook_type, locked_paths, precut_paths, media_type)
+    mix_requested = Signal(list, str, int, str, list, list, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.filepaths = []  # de-duplicated, preserves add order
         self._rows = {}  # filepath -> FileRowWidget
         self._durations = {}  # filepath -> seconds (or None), filled in as probes complete
+        self._locked = set()  # filepaths ticked to always be used
+        self._precut = set()  # filepaths the user already cut themselves
         self._duration_workers = []
+        self._media_type = pipeline.MEDIA_AUDIO
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(theme.SPACE_6, theme.SPACE_6, theme.SPACE_6, theme.SPACE_6)
@@ -131,6 +146,17 @@ class SetupScreen(QWidget):
             f"font-size: 12px; color: {theme.NEUTRAL[500]}; padding: {theme.SPACE_8}px {theme.SPACE_4}px;"
         )
 
+        self.lock_hint_label = QLabel(
+            "Lock: always use the track (its closest section if it doesn't match "
+            "the hook).  Pre-cut: you already cut it — used whole, as is."
+        )
+        self.lock_hint_label.setWordWrap(True)
+        self.lock_hint_label.setStyleSheet(
+            f"font-size: 11px; color: {theme.NEUTRAL[500]}; "
+            f"padding: {theme.SPACE_4}px {theme.SPACE_6}px 0 {theme.SPACE_6}px;"
+        )
+
+        layout.addWidget(self.lock_hint_label)
         layout.addWidget(self.list_widget, 1)
         layout.addWidget(self.empty_label)
 
@@ -176,7 +202,15 @@ class SetupScreen(QWidget):
         title_label.setStyleSheet(f"font-size: 25px; font-weight: 600; color: {theme.TEXT};")
         heading.addWidget(session_label)
         heading.addWidget(title_label)
-        layout.addLayout(heading)
+
+        heading_row = QHBoxLayout()
+        heading_row.addLayout(heading)
+        heading_row.addStretch(1)
+        self.media_control = SegmentedControl(_MEDIA_OPTIONS)
+        self.media_control.setFixedWidth(170)
+        self.media_control.changed.connect(self._on_media_changed)
+        heading_row.addWidget(self.media_control, 0, Qt.AlignBottom)
+        layout.addLayout(heading_row)
 
         mode_wrap = QVBoxLayout()
         mode_wrap.setSpacing(theme.SPACE_3)
@@ -267,7 +301,7 @@ class SetupScreen(QWidget):
         )
         self.minutes_label.setAttribute(Qt.WA_TransparentForMouseEvents)
 
-        minutes_caption = QLabel("MINUTES", overlay)
+        minutes_caption = QLabel("MIN : SEC", overlay)
         minutes_caption.setGeometry(30, 140, 180, 14)
         minutes_caption.setAlignment(Qt.AlignCenter)
         minutes_caption.setStyleSheet(
@@ -309,7 +343,7 @@ class SetupScreen(QWidget):
             if path in self.filepaths:
                 continue
             ext = os.path.splitext(path)[1].lower()
-            if ext not in pipeline.AUDIO_EXTENSIONS:
+            if ext not in pipeline.MEDIA_EXTENSIONS[self._media_type]:
                 continue
             self.filepaths.append(path)
             self._add_row(path, self._durations.get(path))
@@ -338,11 +372,15 @@ class SetupScreen(QWidget):
         if row is not None:
             row.set_duration(duration)
         self._update_empty_state()
+        if path in self._precut:
+            self._update_length_range()
 
     def _add_row(self, path, duration):
         item = QListWidgetItem()
         row = FileRowWidget(path, duration)
         row.remove_clicked.connect(self._remove_file)
+        row.locked_changed.connect(self._on_locked_changed)
+        row.precut_changed.connect(self._on_precut_changed)
         item.setSizeHint(row.sizeHint())
         self.list_widget.addItem(item)
         self.list_widget.setItemWidget(item, row)
@@ -353,6 +391,8 @@ class SetupScreen(QWidget):
             self.filepaths.remove(filepath)
         self._rows.pop(filepath, None)
         self._durations.pop(filepath, None)
+        self._locked.discard(filepath)
+        self._precut.discard(filepath)
 
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
@@ -365,24 +405,79 @@ class SetupScreen(QWidget):
         self._update_length_range()
         self._refresh_mix_button()
 
+    def _on_locked_changed(self, filepath, locked):
+        if locked:
+            self._locked.add(filepath)
+        else:
+            self._locked.discard(filepath)
+        self._update_empty_state()
+
+    def _on_precut_changed(self, filepath, precut):
+        if precut:
+            self._precut.add(filepath)
+        else:
+            self._precut.discard(filepath)
+        self._update_empty_state()
+        self._update_length_range()
+
     def _update_empty_state(self):
         n = len(self.filepaths)
         has_files = n > 0
         self.list_widget.setVisible(has_files)
+        self.lock_hint_label.setVisible(has_files)
         self.empty_label.setVisible(not has_files)
-        self.count_label.setText("1 track" if n == 1 else f"{n} tracks")
+        count = "1 track" if n == 1 else f"{n} tracks"
+        locked_only = self._locked - self._precut
+        if locked_only:
+            count += f" · {len(locked_only)} locked"
+        if self._precut:
+            count += f" · {len(self._precut)} pre-cut"
+        self.count_label.setText(count)
 
         total = sum(self._durations.get(p) or 0 for p in self.filepaths)
+        noun = "video" if self._media_type == pipeline.MEDIA_VIDEO else "audio"
         self.source_total_label.setText(
-            f"{format_duration(total)} of source audio" if n else "Nothing loaded"
+            f"{format_duration(total)} of source {noun}" if n else "Nothing loaded"
         )
 
     # ------------------------------------------------------------------
     # Mode / hook / length state
     # ------------------------------------------------------------------
 
+    def _on_media_changed(self, media_type):
+        if self.filepaths:
+            noun = "videos" if media_type == pipeline.MEDIA_VIDEO else "audio files"
+            answer = QMessageBox.question(
+                self,
+                "Switch format?",
+                f"A mix uses either MP3 or MP4 sources, not both. Switching to "
+                f"{noun} clears the {len(self.filepaths)} track(s) already added.",
+            )
+            if answer != QMessageBox.Yes:
+                self.media_control.set_current(self._media_type, emit=False)
+                return
+            self._clear_files()
+        self._apply_media_type(media_type)
+
+    def _apply_media_type(self, media_type):
+        self._media_type = media_type
+        is_video = media_type == pipeline.MEDIA_VIDEO
+        self.drop_area.set_media_type(media_type)
+        self.mode_control.setVisible(not is_video)
+        self._on_mode_changed(self.mode_control.current())
+        self._update_empty_state()
+        self._refresh_mix_button()
+
+    def _current_mode(self):
+        if self._media_type == pipeline.MEDIA_VIDEO:
+            return pipeline.MODE_NORMAL
+        return self.mode_control.current()
+
     def _on_mode_changed(self, mode):
-        self.mode_desc_label.setText(MODE_DESCRIPTIONS.get(mode, ""))
+        if self._media_type == pipeline.MEDIA_VIDEO:
+            self.mode_desc_label.setText(VIDEO_MODE_DESCRIPTION)
+        else:
+            self.mode_desc_label.setText(MODE_DESCRIPTIONS.get(mode, ""))
         self._update_length_range()
 
     def _on_hook_changed(self, hook_type):
@@ -392,15 +487,19 @@ class SetupScreen(QWidget):
         self._refresh_minutes_label()
 
     def _update_length_range(self):
-        mode = self.mode_control.current()
+        mode = self._current_mode()
         n = len(self.filepaths)
-        lo, hi = pipeline.estimate_duration_range(n, mode)
-        lo_m = max(1, int(lo // 60))
-        hi_m = max(lo_m + 1, -(-int(hi) // 60))  # ceil division
+        precut_durations = [self._durations.get(p) or 0.0 for p in self.filepaths if p in self._precut]
+        lo, hi = pipeline.estimate_duration_range(n, mode, self._media_type, precut_durations)
 
-        self._range_lo_m = lo_m
-        self._range_hi_m = hi_m
-        self.range_label.setText(f"{lo_m} min — {hi_m} min")
+        # Exact seconds, rounded inward: the dial only ever offers lengths
+        # the mix can actually reach (whole-minute steps used to round
+        # outward, so e.g. "2 min" could produce a 1:07 mix).
+        self._range_lo_s = int(-(-lo // 1))  # ceil
+        self._range_hi_s = max(self._range_lo_s, int(hi))
+        self.range_label.setText(
+            f"{format_duration(self._range_lo_s)} — {format_duration(self._range_hi_s)}"
+        )
 
         can_mix = n >= 2
         if can_mix:
@@ -412,17 +511,15 @@ class SetupScreen(QWidget):
         self._refresh_minutes_label()
 
     def _refresh_minutes_label(self):
-        lo_m = getattr(self, "_range_lo_m", 1)
-        hi_m = getattr(self, "_range_hi_m", 2)
-        frac = self.length_dial.fraction()
-        minutes = lo_m + round(frac * (hi_m - lo_m))
-        self.minutes_label.setText(str(minutes))
+        self.minutes_label.setText(format_duration(self._current_seconds()))
 
-    def _current_minutes(self):
-        lo_m = getattr(self, "_range_lo_m", 1)
-        hi_m = getattr(self, "_range_hi_m", 2)
-        frac = self.length_dial.fraction()
-        return lo_m + round(frac * (hi_m - lo_m))
+    def _current_seconds(self):
+        """Target mix length picked on the dial, in 5-second steps, never
+        outside the reachable range."""
+        lo = getattr(self, "_range_lo_s", 0)
+        hi = getattr(self, "_range_hi_s", 0)
+        target = lo + self.length_dial.fraction() * (hi - lo)
+        return int(min(max(round(target / 5.0) * 5, lo), hi))
 
     # ------------------------------------------------------------------
     # Mix button
@@ -452,20 +549,34 @@ class SetupScreen(QWidget):
 
     def _on_mix_clicked(self):
         if len(self.filepaths) >= 2:
-            mode = self.mode_control.current()
+            mode = self._current_mode()
             hook_type = self.hook_dial.current()
-            target_duration_sec = self._current_minutes() * 60
-            self.mix_requested.emit(list(self.filepaths), mode, target_duration_sec, hook_type)
+            target_duration_sec = self._current_seconds()
+            locked = [p for p in self.filepaths if p in self._locked]
+            precut = [p for p in self.filepaths if p in self._precut]
+            self.mix_requested.emit(
+                list(self.filepaths), mode, target_duration_sec, hook_type, locked, precut,
+                self._media_type,
+            )
 
     # ------------------------------------------------------------------
     # Reset
     # ------------------------------------------------------------------
 
-    def reset(self):
+    def _clear_files(self):
         self.filepaths = []
         self._rows = {}
         self._durations = {}
+        self._locked = set()
+        self._precut = set()
         self.list_widget.clear()
+
+    def reset(self):
+        # The MP3/MP4 choice deliberately survives a reset: someone making
+        # video mixes will usually want the next one to be video too.
+        self._clear_files()
+        self.drop_area.set_media_type(self._media_type)
+        self.mode_control.setVisible(self._media_type != pipeline.MEDIA_VIDEO)
         self.mode_control.set_current(pipeline.MODE_LOOP, emit=False)
         self.hook_dial.set_current(pipeline.HOOK_TYPE_NORMAL, emit=False)
         self.length_dial.set_fraction(0.5, emit=False)

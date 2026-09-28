@@ -2,12 +2,19 @@
 Core audio mashup pipeline: BPM detection, hook extraction (with an
 optional reprise section), and crossfade combining.
 
+Video sources (mp4 etc.) go through the exact same audio analysis; the
+cut points found in their soundtrack are then applied to the picture as
+well (see render_video_mix).
+
 This module has no UI dependencies. It is used by the CLI script
 (mashup.py) and by the PySide6 desktop app (app/).
 """
 
 import os
 import glob
+import shutil
+import subprocess
+import tempfile
 import warnings
 
 import numpy as np
@@ -35,6 +42,17 @@ CROSSFADE_MS = 3000
 EXPORT_BITRATE = "320k"
 
 AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a")
+VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".webm")
+
+# Media type of a mix: every source in one mix is either audio (mp3 out)
+# or video (mp4 out) -- the two are never mixed together.
+MEDIA_AUDIO = "audio"
+MEDIA_VIDEO = "video"
+MEDIA_EXTENSIONS = {
+    MEDIA_AUDIO: AUDIO_EXTENSIONS,
+    MEDIA_VIDEO: VIDEO_EXTENSIONS,
+}
+DEFAULT_VIDEO_OUTPUT_FILENAME = "party_mix.mp4"
 
 ANALYSIS_SR = 22050          # sample rate used for BPM/energy analysis
 ENERGY_WINDOW_SEC = 1.0      # window size for RMS energy estimation; also
@@ -105,6 +123,10 @@ HOOK_TYPE_LABELS = {
 # dance material even without internal contrast, so this floor is kept
 # low rather than requiring a strong quiet/loud split.
 DISTINCT_DYNAMICS_MIN_RELATIVE_STD = 0.07
+# A whole file quieter than this (average dBFS) has no usable audio at
+# all -- typically a broken download -- and is skipped even if locked or
+# pre-cut, rather than leaving a dead gap in the mix.
+SILENT_FILE_DBFS = -60.0
 # Melody windows must have at least this much RMS (percentile of the
 # song's own RMS distribution) to avoid picking near-silent gaps.
 MELODY_RMS_FLOOR_PERCENTILE = 20
@@ -122,6 +144,20 @@ MELODY_MAX_TEMPO_BPM = 115.0
 # bass/kick-heavy tracks.
 KUTHU_OCTAVE_CORRECTION_BPM = 85.0
 
+# Video mixes: only Normal Mix is offered (Loop/Ultra's short, repeated
+# bursts look choppy on screen), and every clip stays at least
+# VIDEO_SEGMENT_MIN_SEC long -- anything shorter reads as a jump cut
+# rather than a section of the music video. The max is still dynamic per
+# song (weighted by hook-type fit) like the audio modes, and is also the
+# window the hook search scans with for video (see hook_window_sec), so a
+# strong hook really can run the full VIDEO_SEGMENT_MAX_SEC.
+VIDEO_SEGMENT_MIN_SEC = 25.0
+VIDEO_SEGMENT_MAX_SEC = 45.0
+VIDEO_WIDTH = 1920
+VIDEO_HEIGHT = 1080
+VIDEO_FPS = 30
+VIDEO_AUDIO_BITRATE = "192k"
+
 
 # --------------------------------------------------------------------------
 # Analysis helpers
@@ -129,8 +165,13 @@ KUTHU_OCTAVE_CORRECTION_BPM = 85.0
 
 def get_audio_files(folder):
     """Return sorted list of audio file paths in folder matching supported extensions."""
+    return get_media_files(folder, MEDIA_AUDIO)
+
+
+def get_media_files(folder, media_type=MEDIA_AUDIO):
+    """Return sorted list of file paths in folder for the given media type."""
     files = []
-    for ext in AUDIO_EXTENSIONS:
+    for ext in MEDIA_EXTENSIONS[media_type]:
         files.extend(glob.glob(os.path.join(folder, f"*{ext}")))
     return sorted(files)
 
@@ -228,9 +269,21 @@ def compute_local_tempo(times, y, sr):
     return local_tempo
 
 
+def _whole_track_window(duration, hook_window_sec=HOOK_TARGET_SEC):
+    """Last-resort window for a locked song that has no usable hook region
+    at all (too short or silent): the valid middle of the track, or the
+    whole track if even that is too short.
+    """
+    valid_start = duration * INTRO_SKIP_FRACTION
+    valid_end = duration * (1.0 - OUTRO_SKIP_FRACTION)
+    if valid_end - valid_start < HOOK_MIN_SEC:
+        valid_start, valid_end = 0.0, duration
+    return [(valid_start, min(valid_start + hook_window_sec, valid_end), 0.0)]
+
+
 def find_typed_hook_windows(
     times, rms, centroid, duration, hook_type, num_windows=HOOKS_PER_SONG,
-    local_tempo=None, repetition=None
+    local_tempo=None, repetition=None, relaxed=False, hook_window_sec=HOOK_TARGET_SEC
 ):
     """Like find_top_hook_windows, but ranks candidate windows by a
     combined energy+brightness score instead of energy alone, and can
@@ -251,23 +304,29 @@ def find_typed_hook_windows(
     the "calm section" melody is looking for is often a verse/bridge that
     deliberately *doesn't* repeat as much as the chorus, so biasing
     toward repetition there would work against the point of that mode.
+
+    relaxed=True is used for songs the user locked into the mix: the
+    "does this song qualify at all" gates (flat dynamics, melody's tempo
+    ceiling) are dropped, so the same scoring simply returns whichever
+    window comes *closest* to the hook type instead of nothing.
     """
+    no_match = _whole_track_window(duration, hook_window_sec) if relaxed else []
     valid_start = duration * INTRO_SKIP_FRACTION
     valid_end = duration * (1.0 - OUTRO_SKIP_FRACTION)
 
     if valid_end - valid_start < HOOK_MIN_SEC:
-        return []
+        return no_match
 
     valid_mask = (times >= valid_start) & (times <= valid_end)
     valid_indices = np.where(valid_mask)[0]
     if len(valid_indices) == 0:
-        return []
+        return no_match
 
     valid_rms = rms[valid_indices]
     mean_rms = float(np.mean(valid_rms))
     if mean_rms <= 0:
-        return []
-    if hook_type != HOOK_TYPE_KUTHU:
+        return no_match
+    if hook_type != HOOK_TYPE_KUTHU and not relaxed:
         # Flat-energy songs have no genuine melody/dance contrast — skip
         # them entirely rather than picking an arbitrary window. This
         # doesn't apply to kuthu: a relentlessly loud, non-stop beat
@@ -276,7 +335,7 @@ def find_typed_hook_windows(
         if relative_std < DISTINCT_DYNAMICS_MIN_RELATIVE_STD:
             return []
 
-    window_sec = min(HOOK_TARGET_SEC, valid_end - valid_start)
+    window_sec = min(hook_window_sec, valid_end - valid_start)
     step = times[1] - times[0] if len(times) > 1 else ENERGY_WINDOW_SEC
     frames_per_window = max(int(round(window_sec / step)), 1)
 
@@ -330,7 +389,7 @@ def find_typed_hook_windows(
             if avg_rms < rms_floor:
                 continue
             avg_tempo = float(np.mean(local_tempo[idx:end_idx]))
-            if avg_tempo > MELODY_MAX_TEMPO_BPM:
+            if avg_tempo > MELODY_MAX_TEMPO_BPM and not relaxed:
                 continue
             avg_centroid = float(np.mean(centroid[idx:end_idx]))
             norm_centroid = (avg_centroid - c_min) / c_range
@@ -355,7 +414,7 @@ def find_typed_hook_windows(
         candidates.append((combined, idx, end_idx))
 
     if not candidates:
-        return []
+        return no_match
 
     candidates.sort(key=lambda c: c[0], reverse=True)
     chosen = []
@@ -373,7 +432,8 @@ def find_typed_hook_windows(
     return chosen
 
 
-def find_top_hook_windows(times, rms, duration, num_windows=HOOKS_PER_SONG):
+def find_top_hook_windows(times, rms, duration, num_windows=HOOKS_PER_SONG,
+                          hook_window_sec=HOOK_TARGET_SEC):
     """Find up to num_windows non-overlapping [start, end, score] windows
     (sec) of sustained high energy, excluding the intro/outro, ranked by
     a rolling-sum of RMS energy over a window sized to the target hook
@@ -390,7 +450,7 @@ def find_top_hook_windows(times, rms, duration, num_windows=HOOKS_PER_SONG):
         # use the whole valid region as the single hook.
         return [(valid_start, valid_end, 0.0)]
 
-    window_sec = min(HOOK_TARGET_SEC, valid_end - valid_start)
+    window_sec = min(hook_window_sec, valid_end - valid_start)
 
     valid_mask = (times >= valid_start) & (times <= valid_end)
     valid_indices = np.where(valid_mask)[0]
@@ -451,7 +511,7 @@ def audio_segment_to_mono_float(audio, target_sr=ANALYSIS_SR):
     return samples, target_sr
 
 
-def analyze_track(audio, hook_type=HOOK_TYPE_NORMAL):
+def analyze_track(audio, hook_type=HOOK_TYPE_NORMAL, locked=False, hook_window_sec=HOOK_TARGET_SEC):
     """Analyze a pydub AudioSegment. Returns a dict with bpm, duration,
     and a list of beat-snapped hooks ({"hook_start", "hook_end"}). The
     first hook is the strongest section; any further ones are distinct
@@ -460,7 +520,13 @@ def analyze_track(audio, hook_type=HOOK_TYPE_NORMAL):
     hook_type selects which part of the song counts as "the hook" (see
     HOOK_TYPES). For HOOK_TYPE_MELODY/HOOK_TYPE_DANCE/HOOK_TYPE_KUTHU,
     "hooks" may come back empty if the song has no section distinct
-    enough to qualify.
+    enough to qualify -- unless locked=True (the user ticked the song to
+    always be used), in which case the closest-matching section is
+    returned instead and "closest_match" is set in the result.
+
+    hook_window_sec is how long a section the hook search scans for (and
+    so the longest the hook can later be kept at) -- the segment max of
+    the mix being built (see segment_bounds).
     """
     y, sr = audio_segment_to_mono_float(audio)
     duration = librosa.get_duration(y=y, sr=sr)
@@ -470,27 +536,30 @@ def analyze_track(audio, hook_type=HOOK_TYPE_NORMAL):
     beat_times = librosa.frames_to_time(beat_frames, sr=sr)
 
     times, rms = compute_rms_energy(y, sr)
+    closest_match = False
     if hook_type == HOOK_TYPE_NORMAL:
-        raw_windows = find_top_hook_windows(times, rms, duration)
-    elif hook_type == HOOK_TYPE_KUTHU:
-        local_tempo = compute_local_tempo(times, y, sr)
-        repetition = compute_repetition_strength(y, sr, times)
-        raw_windows = find_typed_hook_windows(
-            times, rms, None, duration, hook_type,
-            local_tempo=local_tempo, repetition=repetition
-        )
-    elif hook_type == HOOK_TYPE_MELODY:
-        centroid = compute_spectral_centroid(y, sr)
-        local_tempo = compute_local_tempo(times, y, sr)
-        raw_windows = find_typed_hook_windows(
-            times, rms, centroid, duration, hook_type, local_tempo=local_tempo
-        )
+        raw_windows = find_top_hook_windows(times, rms, duration, hook_window_sec=hook_window_sec)
     else:
-        centroid = compute_spectral_centroid(y, sr)
-        repetition = compute_repetition_strength(y, sr, times)
+        features = {"centroid": None, "local_tempo": None, "repetition": None}
+        if hook_type in (HOOK_TYPE_MELODY, HOOK_TYPE_DANCE):
+            features["centroid"] = compute_spectral_centroid(y, sr)
+        if hook_type in (HOOK_TYPE_MELODY, HOOK_TYPE_KUTHU):
+            features["local_tempo"] = compute_local_tempo(times, y, sr)
+        if hook_type in (HOOK_TYPE_DANCE, HOOK_TYPE_KUTHU):
+            features["repetition"] = compute_repetition_strength(y, sr, times)
+
         raw_windows = find_typed_hook_windows(
-            times, rms, centroid, duration, hook_type, repetition=repetition
+            times, rms, features["centroid"], duration, hook_type,
+            local_tempo=features["local_tempo"], repetition=features["repetition"],
+            hook_window_sec=hook_window_sec,
         )
+        if not raw_windows and locked:
+            raw_windows = find_typed_hook_windows(
+                times, rms, features["centroid"], duration, hook_type,
+                local_tempo=features["local_tempo"], repetition=features["repetition"],
+                relaxed=True, hook_window_sec=hook_window_sec,
+            )
+            closest_match = True
 
     hooks = []
     for raw_start, raw_end, score in raw_windows:
@@ -517,12 +586,42 @@ def analyze_track(audio, hook_type=HOOK_TYPE_NORMAL):
         "bpm": bpm,
         "duration": duration,
         "hooks": hooks,
+        "closest_match": closest_match,
     }
 
 
 # --------------------------------------------------------------------------
 # Audio extraction / combination
 # --------------------------------------------------------------------------
+
+class SourceClip:
+    """A hook's AudioSegment plus where it came from: the source file and
+    the second in that file the clip starts at. Slicing it (as the
+    trim/split helpers below do) keeps that bookkeeping in step, so after
+    planning a mix every final segment still knows exactly which part of
+    which file it is -- which is what lets a video mix cut the picture at
+    the same points the audio was cut.
+
+    Supports len() (milliseconds) and [start_ms:end_ms] slicing, the two
+    AudioSegment operations the planners use.
+    """
+
+    def __init__(self, audio, source_path, source_start_sec):
+        self.audio = audio
+        self.source_path = source_path
+        self.source_start_sec = source_start_sec
+
+    def __len__(self):
+        return len(self.audio)
+
+    def __getitem__(self, key):
+        if not isinstance(key, slice) or key.step is not None:
+            raise TypeError("SourceClip only supports [start_ms:end_ms] slicing")
+        start_ms = min(max(key.start or 0, 0), len(self.audio))
+        return SourceClip(
+            self.audio[key], self.source_path, self.source_start_sec + start_ms / 1000.0
+        )
+
 
 def extract_hook_segment(audio, hook_start, hook_end):
     """Slice the hook out of an already-loaded pydub AudioSegment."""
@@ -531,12 +630,26 @@ def extract_hook_segment(audio, hook_start, hook_end):
     return audio[start_ms:end_ms]
 
 
+def crossfade_lengths(segment_lengths_ms, crossfade_ms=CROSSFADE_MS):
+    """Per-boundary crossfade length (ms) for segments joined in order --
+    one entry per join, i.e. len(segment_lengths_ms) - 1. Shared by the
+    audio combine and the video render so both place every transition at
+    exactly the same moment.
+    """
+    fades = []
+    mixed_len = segment_lengths_ms[0] if segment_lengths_ms else 0
+    for seg_len in segment_lengths_ms[1:]:
+        fade = max(min(crossfade_ms, mixed_len - 1, seg_len - 1), 0)
+        fades.append(fade)
+        mixed_len += seg_len - fade
+    return fades
+
+
 def combine_hooks(hooks, crossfade_ms=CROSSFADE_MS):
     """Crossfade a list of AudioSegments together into one track."""
+    fades = crossfade_lengths([len(h) for h in hooks], crossfade_ms)
     mixed = hooks[0]
-    for segment in hooks[1:]:
-        fade = min(crossfade_ms, len(mixed) - 1, len(segment) - 1)
-        fade = max(fade, 0)
+    for segment, fade in zip(hooks[1:], fades):
         mixed = mixed.append(segment, crossfade=fade)
     return mixed
 
@@ -547,24 +660,209 @@ def export_mix(mix, output_path, bitrate=EXPORT_BITRATE):
 
 
 # --------------------------------------------------------------------------
+# Video rendering
+# --------------------------------------------------------------------------
+
+class RenderCancelled(Exception):
+    """Raised by render_video_mix when should_cancel() asks it to stop."""
+
+
+def _ffmpeg_exe():
+    converter = getattr(AudioSegment, "converter", None)
+    if converter and os.path.isfile(converter):
+        return converter
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def _subprocess_flags():
+    # Keep a console window from flashing up behind the GUI on Windows.
+    return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+_video_encoder_args = None
+
+
+def _pick_video_encoder():
+    """H.264 encoder args for whatever this ffmpeg build has: libx264 on
+    full (GPL) builds, Windows' Media Foundation H.264 on the LGPL build
+    packaged releases bundle, and plain MPEG-4 as a last resort.
+    """
+    global _video_encoder_args
+    if _video_encoder_args is not None:
+        return _video_encoder_args
+    try:
+        out = subprocess.run(
+            [_ffmpeg_exe(), "-hide_banner", "-encoders"],
+            capture_output=True, text=True, creationflags=_subprocess_flags(),
+        ).stdout
+    except OSError:
+        out = ""
+    if " libx264 " in out:
+        args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
+    elif " h264_mf " in out:
+        args = ["-c:v", "h264_mf", "-b:v", "8M"]
+    else:
+        args = ["-c:v", "mpeg4", "-q:v", "3"]
+    _video_encoder_args = args
+    return args
+
+
+def _video_filter_graph(clips, fades):
+    """Build the filter_complex that normalizes every clip to one frame
+    size/rate (letterboxing as needed, and holding the last frame if a
+    video track ends before its audio does) and then crossfades them at
+    the same offsets combine_hooks used for the audio.
+    """
+    size = f"{VIDEO_WIDTH}:{VIDEO_HEIGHT}"
+    parts = []
+    for i, clip in enumerate(clips):
+        dur = len(clip) / 1000.0
+        parts.append(
+            f"[{i}:v]fps={VIDEO_FPS},"
+            f"scale={size}:force_original_aspect_ratio=decrease,"
+            f"pad={size}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p,"
+            f"tpad=stop_mode=clone:stop_duration={dur:.3f},"
+            f"trim=duration={dur:.3f},setpts=PTS-STARTPTS,settb=AVTB[v{i}]"
+        )
+
+    prev = "v0"
+    elapsed_ms = len(clips[0])
+    for i, fade in enumerate(fades, start=1):
+        out = f"x{i}"
+        if fade >= 40:  # at least ~one frame, or xfade has nothing to blend
+            offset = (elapsed_ms - fade) / 1000.0
+            parts.append(
+                f"[{prev}][v{i}]xfade=transition=fade:"
+                f"duration={fade / 1000.0:.3f}:offset={offset:.3f}[{out}]"
+            )
+        else:
+            parts.append(f"[{prev}][v{i}]concat=n=2:v=1:a=0[{out}]")
+        elapsed_ms += len(clips[i]) - fade
+        prev = out
+
+    parts.append(f"[{prev}]format=yuv420p[vout]")
+    return ";".join(parts)
+
+
+def render_video_mix(clips, audio_mix, output_path, progress_callback=None,
+                     should_cancel=None, crossfade_ms=CROSSFADE_MS):
+    """Render a video mix: each SourceClip's picture is cut from its source
+    video at the same timestamps as its audio, the clips are crossfaded
+    with the same per-boundary fades as the audio mix, and the already-
+    mixed audio (audio_mix, from combine_hooks) is laid underneath -- so
+    what you hear is identical to the mp3 version of the same mix.
+
+    progress_callback(message, percent) reports 0-100 across the encode.
+    should_cancel(), if given, is polled during the encode; returning True
+    stops ffmpeg and raises RenderCancelled.
+    """
+    if not clips:
+        raise ValueError("No clips to render")
+
+    fades = crossfade_lengths([len(c) for c in clips], crossfade_ms)
+    total_sec = len(audio_mix) / 1000.0
+    work_dir = tempfile.mkdtemp(prefix="svmix_render_")
+    stderr_path = os.path.join(work_dir, "ffmpeg.log")
+    try:
+        audio_path = os.path.join(work_dir, "mix.wav")
+        audio_mix.export(audio_path, format="wav")
+
+        cmd = [_ffmpeg_exe(), "-y", "-hide_banner", "-nostats", "-progress", "pipe:1"]
+        for clip in clips:
+            cmd += [
+                "-ss", f"{clip.source_start_sec:.3f}",
+                "-t", f"{len(clip) / 1000.0 + 0.5:.3f}",
+                "-i", clip.source_path,
+            ]
+        cmd += ["-i", audio_path]
+        cmd += [
+            "-filter_complex", _video_filter_graph(clips, fades),
+            "-map", "[vout]", "-map", f"{len(clips)}:a",
+            *_pick_video_encoder(),
+            "-pix_fmt", "yuv420p", "-r", str(VIDEO_FPS),
+            "-c:a", "aac", "-b:a", VIDEO_AUDIO_BITRATE,
+            "-t", f"{total_sec:.3f}",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+
+        with open(stderr_path, "w", encoding="utf-8", errors="replace") as err:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=err, text=True,
+                creationflags=_subprocess_flags(),
+            )
+            try:
+                for line in proc.stdout:
+                    if should_cancel and should_cancel():
+                        proc.kill()
+                        proc.wait()
+                        raise RenderCancelled()
+                    key, _, value = line.strip().partition("=")
+                    if key == "out_time_us" and progress_callback and total_sec > 0:
+                        try:
+                            done_sec = int(value) / 1_000_000
+                        except ValueError:
+                            continue
+                        percent = int(min(max(done_sec / total_sec, 0.0), 1.0) * 100)
+                        progress_callback("Rendering video...", percent)
+                proc.wait()
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+
+        if proc.returncode != 0:
+            with open(stderr_path, encoding="utf-8", errors="replace") as err:
+                tail = err.read().strip().splitlines()[-8:]
+            raise RuntimeError("ffmpeg could not render the video:\n" + "\n".join(tail))
+    except RenderCancelled:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        raise
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+    return output_path
+
+
+# --------------------------------------------------------------------------
 # Mix modes & duration planning
 # --------------------------------------------------------------------------
 
-def estimate_duration_range(num_songs, mode):
+def segment_bounds(media_type=MEDIA_AUDIO):
+    """(min_sec, max_sec) a kept hook segment is trimmed to, per media type."""
+    if media_type == MEDIA_VIDEO:
+        return (VIDEO_SEGMENT_MIN_SEC, VIDEO_SEGMENT_MAX_SEC)
+    return (SEGMENT_MIN_SEC, SEGMENT_MAX_SEC)
+
+
+def estimate_duration_range(num_songs, mode, media_type=MEDIA_AUDIO, precut_durations=()):
     """Return (min_sec, max_sec): the achievable total mix duration for
     num_songs songs in the given mode. Pure arithmetic (no audio
     decoding), so it's cheap enough to call live from the UI as files
-    are added/removed or the mode is changed.
+    are added/removed or the mode is changed. Video mixes are always
+    Normal Mix, with their own segment bounds (see segment_bounds).
+
+    precut_durations lists the lengths (sec) of any pre-cut songs among
+    the num_songs: they're used whole, once, so they add a fixed amount
+    to both ends of the range instead of stretching with it.
     """
     if num_songs <= 0:
         return (0.0, 0.0)
 
     crossfade_sec = CROSSFADE_MS / 1000.0
+    precut_count = min(len(precut_durations), num_songs)
+    precut_total = float(sum(precut_durations))
+    num_songs -= precut_count
 
     def total_for(segment_count, segment_len):
-        return segment_count * segment_len - max(segment_count - 1, 0) * crossfade_sec
+        pieces = segment_count + precut_count
+        return segment_count * segment_len + precut_total - max(pieces - 1, 0) * crossfade_sec
 
-    if mode == MODE_NORMAL:
+    if media_type == MEDIA_VIDEO:
+        seg_min, seg_max = segment_bounds(MEDIA_VIDEO)
+        lo = total_for(num_songs, seg_min)
+        hi = total_for(num_songs, seg_max)
+    elif mode == MODE_NORMAL:
         lo = total_for(num_songs, SEGMENT_MIN_SEC)
         hi = total_for(num_songs, SEGMENT_MAX_SEC)
     elif mode == MODE_ULTRA:
@@ -794,16 +1092,23 @@ def _compute_dynamic_lengths(songs, target_duration_sec, score_key,
 
 def _group_by_song(results):
     """Group process_files' flat per-hook results back into a list of
-    per-song dicts: {"filename", "bpm", "hooks": [result, ...]}, hooks
-    sorted by variation (0 = main hook, 1 = reprise).
+    per-song dicts: {"filename", "bpm", "precut", "hooks": [result, ...]},
+    hooks sorted by variation (0 = main hook, 1 = reprise).
     """
     songs = []
-    by_filename = {}
+    by_path = {}
     for r in results:
-        song = by_filename.get(r["filename"])
+        # Keyed by full path, not filename: two different files can share
+        # a basename (same song name in two folders).
+        song = by_path.get(r["filepath"])
         if song is None:
-            song = {"filename": r["filename"], "bpm": r["bpm"], "hooks": []}
-            by_filename[r["filename"]] = song
+            song = {
+                "filename": r["filename"],
+                "bpm": r["bpm"],
+                "precut": r.get("precut", False),
+                "hooks": [],
+            }
+            by_path[r["filepath"]] = song
             songs.append(song)
         song["hooks"].append(r)
     for song in songs:
@@ -811,65 +1116,261 @@ def _group_by_song(results):
     return songs
 
 
-def _plan_normal_mix(songs, target_duration_sec):
+def _main_score(song):
+    return song["hooks"][0]["score"]
+
+
+def _main_segment(song, length_sec):
+    """A song's main hook trimmed (on a beat) to length_sec -- or, for a
+    pre-cut song, the user's own cut exactly as it is.
+    """
+    hook = song["hooks"][0]
+    if song["precut"]:
+        return hook["segment"]
+    return trim_segment_to_beat(hook["segment"], length_sec, hook.get("beat_offsets"))
+
+
+def _fit_around_precut(ordered_songs, target_duration_sec, min_sec, max_sec, segments_per_song=1):
+    """Main-hook length (sec) for each song in ordered_songs. A pre-cut
+    song's is its own full length, fixed; every other song gets a dynamic
+    length in [min_sec, max_sec] (see _compute_dynamic_lengths), sized so
+    the mix as a whole -- pre-cut songs included -- still lands on
+    target_duration_sec. segments_per_song is how many crossfaded pieces
+    each adjustable song ends up as (Ultra Mix splits each into two);
+    pre-cut songs are always a single piece.
+    """
+    crossfade_sec = CROSSFADE_MS / 1000.0
+    lengths = [
+        len(s["hooks"][0]["segment"]) / 1000.0 if s["precut"] else None for s in ordered_songs
+    ]
+    adjustable = [s for s in ordered_songs if not s["precut"]]
+    if not adjustable:
+        return lengths
+
+    m = len(adjustable)
+    p = len(ordered_songs) - m
+    fixed_total = sum(length for length in lengths if length is not None)
+    adj_target = None
+    if target_duration_sec is not None:
+        # mix total = sum(all pieces) - (pieces - 1) * crossfade, and
+        # _compute_dynamic_lengths already adds (m - 1) crossfades itself.
+        pieces = p + segments_per_song * m
+        adj_target = (
+            target_duration_sec + (pieces - 1) * crossfade_sec - fixed_total - (m - 1) * crossfade_sec
+        )
+    adj_lengths = iter(
+        _compute_dynamic_lengths(adjustable, adj_target, _main_score, min_sec=min_sec, max_sec=max_sec)
+    )
+    return [length if length is not None else next(adj_lengths) for length in lengths]
+
+
+def _plan_normal_mix(songs, target_duration_sec,
+                     min_sec=SEGMENT_MIN_SEC, max_sec=SEGMENT_MAX_SEC):
     """Every song's main hook exactly once, ordered by feel (tempo +
     energy) rather than raw BPM, each given a dynamic length in
-    [SEGMENT_MIN_SEC, SEGMENT_MAX_SEC] weighted by how strongly it fits
-    the selected hook type, scaled to hit target_duration_sec overall.
+    [min_sec, max_sec] weighted by how strongly it fits the selected
+    hook type, scaled to hit target_duration_sec overall. Pre-cut songs
+    are used whole, and the others are sized around them.
     """
-    n = len(songs)
-    if n == 0:
+    if not songs:
         return []
-
     ordered_songs = order_by_feel(songs)
-    lengths = _compute_dynamic_lengths(
-        ordered_songs, target_duration_sec, score_key=lambda s: s["hooks"][0]["score"]
+    lengths = _fit_around_precut(ordered_songs, target_duration_sec, min_sec, max_sec)
+    return [_main_segment(s, length) for s, length in zip(ordered_songs, lengths)]
+
+
+# How much each aspect of a transition counts when choosing the running
+# order of a video mix (see _transition_cost). Each aspect is first scaled
+# so that 1.0 means "clearly noticeable": a TRANSITION_TEMPO_STEP tempo
+# gap, a TRANSITION_LOUDNESS_STEP_DB loudness jump, or a
+# TRANSITION_HARMONY_STEP drop in chroma similarity.
+TRANSITION_TEMPO_WEIGHT = 0.45
+TRANSITION_LOUDNESS_WEIGHT = 0.25
+TRANSITION_HARMONY_WEIGHT = 0.30
+TRANSITION_TEMPO_STEP = 0.08          # 8% tempo difference
+TRANSITION_LOUDNESS_STEP_DB = 6.0
+TRANSITION_HARMONY_STEP = 0.2
+# Half/double-time matches (e.g. 80 vs 160 BPM) still lock together on
+# the beat, but not quite as naturally as the same tempo does.
+TRANSITION_OCTAVE_PENALTY = 0.35
+
+
+def _clip_tempo(clip, beat_offsets, fallback_bpm):
+    """Tempo (BPM) of the part of a hook that actually made it into the
+    clip, from the beats analyze_track found inside it; the song's overall
+    BPM if there aren't enough of them (e.g. a pre-cut file)."""
+    clip_sec = len(clip) / 1000.0
+    beats = [b for b in (beat_offsets or []) if b <= clip_sec]
+    if len(beats) >= 4:
+        interval = float(np.median(np.diff(beats)))
+        if interval > 0:
+            return 60.0 / interval
+    return fallback_bpm
+
+
+def _edge_features(audio):
+    """Loudness (dBFS) and normalized mean chroma of a short stretch of
+    audio -- what's audible during one side of a crossfade."""
+    y, sr = audio_segment_to_mono_float(audio)
+    loudness = audio.dBFS if audio.rms > 0 else -90.0
+    if len(y) < 2048:
+        return loudness, np.zeros(12)
+    chroma = librosa.feature.chroma_stft(y=y, sr=sr).mean(axis=1)
+    norm = float(np.linalg.norm(chroma))
+    return loudness, (chroma / norm if norm > 0 else chroma)
+
+
+def _transition_profile(song, clip):
+    """Everything needed to judge how well this clip hands over to, or
+    takes over from, another: its tempo, plus loudness and harmony of its
+    first and last crossfade-length stretch (the parts that overlap the
+    neighbouring clips)."""
+    edge_ms = min(CROSSFADE_MS, len(clip))
+    head_db, head_chroma = _edge_features(clip.audio[:edge_ms])
+    tail_db, tail_chroma = _edge_features(clip.audio[-edge_ms:])
+    return {
+        "tempo": _clip_tempo(clip, song["hooks"][0].get("beat_offsets"), song["bpm"]),
+        "head_db": head_db, "head_chroma": head_chroma,
+        "tail_db": tail_db, "tail_chroma": tail_chroma,
+    }
+
+
+def _transition_cost(out_profile, in_profile):
+    """How rough the crossfade from one clip into the next would sound:
+    0 is seamless, ~1 is a clearly noticeable change. Weighs tempo match
+    (half/double time allowed), the loudness jump across the overlap, and
+    how well the harmony at the end of the outgoing clip fits the start
+    of the incoming one."""
+    t_out, t_in = out_profile["tempo"], in_profile["tempo"]
+    tempo_cost = 1.0
+    if t_out > 0 and t_in > 0:
+        octaves = abs(np.log2(t_in / t_out))
+        off_octave = abs(octaves - round(octaves))
+        tempo_cost = off_octave / np.log2(1 + TRANSITION_TEMPO_STEP)
+        if round(octaves) != 0:
+            tempo_cost += TRANSITION_OCTAVE_PENALTY
+    loudness_cost = abs(out_profile["tail_db"] - in_profile["head_db"]) / TRANSITION_LOUDNESS_STEP_DB
+    similarity = float(np.dot(out_profile["tail_chroma"], in_profile["head_chroma"]))
+    harmony_cost = max(0.0, 1.0 - similarity) / TRANSITION_HARMONY_STEP
+    return (
+        TRANSITION_TEMPO_WEIGHT * min(tempo_cost, 3.0)
+        + TRANSITION_LOUDNESS_WEIGHT * min(loudness_cost, 3.0)
+        + TRANSITION_HARMONY_WEIGHT * min(harmony_cost, 3.0)
     )
-    return [
-        trim_segment_to_beat(s["hooks"][0]["segment"], length, s["hooks"][0].get("beat_offsets"))
-        for s, length in zip(ordered_songs, lengths)
+
+
+def _best_transition_order(cost):
+    """Order indices 0..n-1 to minimize the summed cost[a][b] of every
+    consecutive a -> b hand-off. Exact for small mixes; for bigger ones,
+    the best greedy chain from every starting song, polished with 2-opt
+    segment reversals."""
+    n = len(cost)
+    if n <= 2:
+        if n == 2 and cost[1][0] < cost[0][1]:
+            return [1, 0]
+        return list(range(n))
+
+    def path_cost(order):
+        return sum(cost[a][b] for a, b in zip(order, order[1:]))
+
+    if n <= 10:
+        # Held-Karp over subsets: best[(mask, last)] = (cost, previous).
+        best = {(1 << i, i): (0.0, None) for i in range(n)}
+        for mask in range(1, 1 << n):
+            for last in range(n):
+                entry = best.get((mask, last))
+                if entry is None:
+                    continue
+                for nxt in range(n):
+                    if mask & (1 << nxt):
+                        continue
+                    key = (mask | (1 << nxt), nxt)
+                    c = entry[0] + cost[last][nxt]
+                    if key not in best or c < best[key][0]:
+                        best[key] = (c, last)
+        full = (1 << n) - 1
+        last = min(range(n), key=lambda i: best[(full, i)][0])
+        order, mask = [], full
+        while last is not None:
+            order.append(last)
+            prev = best[(mask, last)][1]
+            mask &= ~(1 << last)
+            last = prev
+        return order[::-1]
+
+    best_order = None
+    for start in range(n):
+        order, remaining = [start], set(range(n)) - {start}
+        while remaining:
+            nxt = min(remaining, key=lambda j: cost[order[-1]][j])
+            order.append(nxt)
+            remaining.remove(nxt)
+        improved = True
+        while improved:
+            improved = False
+            for i in range(0, n - 1):
+                for j in range(i + 1, n):
+                    candidate = order[:i] + order[i:j + 1][::-1] + order[j + 1:]
+                    if path_cost(candidate) + 1e-9 < path_cost(order):
+                        order, improved = candidate, True
+        if best_order is None or path_cost(order) < path_cost(best_order):
+            best_order = order
+    return best_order
+
+
+def _plan_video_mix(songs, target_duration_sec,
+                    min_sec=VIDEO_SEGMENT_MIN_SEC, max_sec=VIDEO_SEGMENT_MAX_SEC):
+    """Normal Mix for video, in two steps. First, every song's cut is
+    settled: its strongest hook (see process_files), trimmed to a dynamic
+    length exactly as _plan_normal_mix would (pre-cut songs whole). Only
+    then is the running order chosen, from the finished clips themselves:
+    each possible hand-off is scored on how the end of one clip meets the
+    start of the next (_transition_cost), and the order with the smoothest
+    transitions overall wins.
+    """
+    if not songs:
+        return []
+    lengths = _fit_around_precut(songs, target_duration_sec, min_sec, max_sec)
+    clips = [_main_segment(s, length) for s, length in zip(songs, lengths)]
+    profiles = [_transition_profile(s, c) for s, c in zip(songs, clips)]
+    cost = [
+        [0.0 if a == b else _transition_cost(profiles[a], profiles[b]) for b in range(len(clips))]
+        for a in range(len(clips))
     ]
+    return [clips[i] for i in _best_transition_order(cost)]
 
 
 def _plan_loop_mix(songs, target_duration_sec):
     """Phase A: every song's main hook once, dynamic length weighted by
-    hook-type fit within [SEGMENT_MIN_SEC, SEGMENT_MAX_SEC]. Phase B
-    (once phase A maxes out): add reprise hooks, highest-fit song
-    first, until the target is reached.
+    hook-type fit within [SEGMENT_MIN_SEC, SEGMENT_MAX_SEC] (pre-cut songs
+    whole). Phase B (once phase A maxes out): add reprise hooks, highest-
+    fit song first, until the target is reached. Pre-cut songs have no
+    reprise -- the user's cut is the only part of them there is.
     """
     n = len(songs)
     if n == 0:
         return []
 
     crossfade_sec = CROSSFADE_MS / 1000.0
-
-    def total_for(segment_count, segment_len):
-        return segment_count * segment_len - max(segment_count - 1, 0) * crossfade_sec
-
-    phase_a_max = total_for(n, SEGMENT_MAX_SEC)
     ordered_songs = order_by_feel(songs)
+    main_max = [
+        len(s["hooks"][0]["segment"]) / 1000.0 if s["precut"] else SEGMENT_MAX_SEC
+        for s in ordered_songs
+    ]
+    phase_a_max = sum(main_max) - (n - 1) * crossfade_sec
 
     if target_duration_sec <= phase_a_max or n == 1:
-        lengths = _compute_dynamic_lengths(
-            ordered_songs, target_duration_sec, score_key=lambda s: s["hooks"][0]["score"]
-        )
-        return [
-            trim_segment_to_beat(s["hooks"][0]["segment"], length, s["hooks"][0].get("beat_offsets"))
-            for s, length in zip(ordered_songs, lengths)
-        ]
+        return _plan_normal_mix(songs, target_duration_sec)
 
     # Phase B: mains locked at full length, reprises added — highest
     # hook-type fit first — until we reach the target. Which songs to
     # include is chosen greedily off an average length estimate; the
     # included set's actual per-song lengths are then computed
     # dynamically (weighted by fit) to close the remaining gap.
-    mains = [
-        trim_segment_to_beat(s["hooks"][0]["segment"], SEGMENT_MAX_SEC, s["hooks"][0].get("beat_offsets"))
-        for s in ordered_songs
-    ]
+    mains = [_main_segment(s, SEGMENT_MAX_SEC) for s in ordered_songs]
 
     current_total = phase_a_max
-    reprise_candidates = [s for s in songs if len(s["hooks"]) > 1]
+    reprise_candidates = [s for s in songs if len(s["hooks"]) > 1 and not s["precut"]]
     reprise_candidates.sort(key=lambda s: s["hooks"][1]["score"], reverse=True)
 
     avg_len = (SEGMENT_MIN_SEC + SEGMENT_MAX_SEC) / 2.0
@@ -910,54 +1411,47 @@ def _plan_ultra_mix(songs, target_duration_sec):
     song before the next. Phase B (once phase A maxes out): songs
     progressively also contribute their reprise hook, split the same
     way and appended as two more rounds, highest-fit song first.
+
+    Pre-cut songs aren't chopped: each plays whole, in the "A" round at
+    its place in the feel order, and has no "B" half or reprise.
     """
     n = len(songs)
     if n == 0:
         return []
 
     crossfade_sec = CROSSFADE_MS / 1000.0
-
-    def total_for(segment_count, segment_len):
-        return segment_count * segment_len - max(segment_count - 1, 0) * crossfade_sec
-
-    phase_a_max = total_for(2 * n, ULTRA_CHUNK_MAX_SEC)
     ordered_songs = order_by_feel(songs)
+    precut_total = sum(len(s["hooks"][0]["segment"]) / 1000.0 for s in ordered_songs if s["precut"])
+    m = sum(1 for s in ordered_songs if not s["precut"])
+    p = n - m
+    phase_a_max = precut_total + 2 * m * ULTRA_CHUNK_MAX_SEC - (p + 2 * m - 1) * crossfade_sec
 
-    if target_duration_sec <= phase_a_max or n == 1:
-        if n == 1:
-            full_lengths = [min(max(target_duration_sec, SEGMENT_MIN_SEC), SEGMENT_MAX_SEC)]
-        else:
-            # 2n halves total with 2n-1 internal crossfades; each
-            # song's full (pre-split) length is what _compute_dynamic_lengths
-            # weighs by fit, so the "+ n * crossfade_sec" below converts
-            # that segment-count crossfade budget into the per-song one
-            # the helper expects (n songs, n-1 crossfades).
-            adj_target = target_duration_sec + n * crossfade_sec
-            full_lengths = _compute_dynamic_lengths(
-                ordered_songs, adj_target, score_key=lambda s: s["hooks"][0]["score"]
-            )
-
+    def split_round(lengths_for_split):
         halves_a, halves_b = [], []
-        for s, length in zip(ordered_songs, full_lengths):
+        for s, chunk_len in zip(ordered_songs, lengths_for_split):
+            if s["precut"]:
+                halves_a.append(s["hooks"][0]["segment"])
+                continue
             a, b = split_into_ultra_chunks_to_beat(
-                s["hooks"][0]["segment"], length / 2.0, s["hooks"][0].get("beat_offsets")
+                s["hooks"][0]["segment"], chunk_len, s["hooks"][0].get("beat_offsets")
             )
             halves_a.append(a)
             halves_b.append(b)
+        return halves_a, halves_b
+
+    if target_duration_sec <= phase_a_max or n == 1:
+        full_lengths = _fit_around_precut(
+            ordered_songs, target_duration_sec, SEGMENT_MIN_SEC, SEGMENT_MAX_SEC, segments_per_song=2
+        )
+        halves_a, halves_b = split_round([length / 2.0 for length in full_lengths])
         return halves_a + halves_b
 
     # Phase B: main hooks locked at max chunk length, reprise chunk-pairs
     # added — highest hook-type fit first — until target is reached.
-    halves_a, halves_b = [], []
-    for s in ordered_songs:
-        a, b = split_into_ultra_chunks_to_beat(
-            s["hooks"][0]["segment"], ULTRA_CHUNK_MAX_SEC, s["hooks"][0].get("beat_offsets")
-        )
-        halves_a.append(a)
-        halves_b.append(b)
+    halves_a, halves_b = split_round([ULTRA_CHUNK_MAX_SEC] * n)
 
     current_total = phase_a_max
-    reprise_candidates = [s for s in songs if len(s["hooks"]) > 1]
+    reprise_candidates = [s for s in songs if len(s["hooks"]) > 1 and not s["precut"]]
     reprise_candidates.sort(key=lambda s: s["hooks"][1]["score"], reverse=True)
 
     avg_chunk = (ULTRA_CHUNK_MIN_SEC + ULTRA_CHUNK_MAX_SEC) / 2.0
@@ -974,9 +1468,9 @@ def _plan_ultra_mix(songs, target_duration_sec):
     ordered_reprises = order_by_feel(
         used_songs, score_key=lambda s: s["hooks"][1]["score"], descending=True
     )
-    m = len(ordered_reprises)
+    r = len(ordered_reprises)
     remaining_target = target_duration_sec - phase_a_max
-    adj_target = remaining_target + (m + 1) * crossfade_sec
+    adj_target = remaining_target + (r + 1) * crossfade_sec
     reprise_lengths = _compute_dynamic_lengths(
         ordered_reprises, adj_target, score_key=lambda s: s["hooks"][1]["score"]
     )
@@ -996,7 +1490,23 @@ def _plan_ultra_mix(songs, target_duration_sec):
 # Orchestration — reusable by both the CLI script and the desktop UI
 # --------------------------------------------------------------------------
 
-def process_files(filepaths, mode=MODE_LOOP, target_duration_sec=None, hook_type=HOOK_TYPE_NORMAL, progress_callback=None):
+def _path_key(path):
+    return os.path.normcase(os.path.abspath(path))
+
+
+def analyze_precut(audio):
+    """BPM of a pre-cut file (the user's own finished cut), for ordering
+    it among the other songs -- no hook search, since the whole file is
+    what gets used.
+    """
+    y, sr = audio_segment_to_mono_float(audio)
+    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+    return float(np.atleast_1d(tempo)[0])
+
+
+def process_files(filepaths, mode=MODE_LOOP, target_duration_sec=None, hook_type=HOOK_TYPE_NORMAL,
+                  progress_callback=None, locked_paths=None, media_type=MEDIA_AUDIO,
+                  precut_paths=None):
     """Run the full pipeline over an explicit list of audio file paths:
     analyze -> extract hook(s) -> order/combine -> crossfade combine.
 
@@ -1008,7 +1518,19 @@ def process_files(filepaths, mode=MODE_LOOP, target_duration_sec=None, hook_type
 
     hook_type is one of HOOK_TYPES, selecting which part of each song is
     used as the hook. A song with no qualifying section for the chosen
-    hook_type (HOOK_TYPE_MELODY/HOOK_TYPE_DANCE only) is skipped.
+    hook_type (HOOK_TYPE_MELODY/HOOK_TYPE_DANCE only) is skipped --
+    unless its path is in locked_paths, in which case its closest-
+    matching section is used instead (see analyze_track).
+
+    Files in precut_paths are the user's own finished cuts: no hook
+    detection or trimming, the whole file goes into the mix once (in its
+    place in the tempo/energy order) and the other songs' lengths are
+    sized around it.
+
+    media_type MEDIA_VIDEO analyzes each video's soundtrack exactly like
+    an audio file, but always plans a Normal Mix with the video segment
+    bounds (see segment_bounds); the returned "clips" then feed
+    render_video_mix.
 
     progress_callback, if given, is called as
     progress_callback(message: str, percent: int) so a caller (CLI or
@@ -1017,8 +1539,12 @@ def process_files(filepaths, mode=MODE_LOOP, target_duration_sec=None, hook_type
     Returns a dict:
         {
             "mix": AudioSegment or None,
+            "clips": [SourceClip, ...],   # the mix's segments, in order
+            "media_type": str,
             "processed_filenames": [str, ...],
             "skipped": [(filename, reason), ...],
+            "closest_match": [filename, ...],  # locked songs that didn't
+                                               # match the hook type
             "total_hooks": int,
         }
     """
@@ -1026,10 +1552,19 @@ def process_files(filepaths, mode=MODE_LOOP, target_duration_sec=None, hook_type
         if progress_callback:
             progress_callback(message, percent)
 
+    locked = {_path_key(p) for p in (locked_paths or [])}
+    precut = {_path_key(p) for p in (precut_paths or [])}
+    if media_type == MEDIA_VIDEO:
+        mode = MODE_NORMAL
+        if target_duration_sec is None:
+            # No target: give every video its longest cut.
+            target_duration_sec = estimate_duration_range(len(filepaths), MODE_NORMAL, MEDIA_VIDEO)[1]
+
     total = len(filepaths)
     results = []
     skipped = []
     processed_filenames = []
+    closest_match = []
 
     for i, filepath in enumerate(filepaths):
         filename = os.path.basename(filepath)
@@ -1039,20 +1574,50 @@ def process_files(filepaths, mode=MODE_LOOP, target_duration_sec=None, hook_type
         try:
             report(f"Analyzing {filename}...", percent)
             audio = AudioSegment.from_file(filepath)
-            info = analyze_track(audio, hook_type=hook_type)
+            if len(audio) == 0 or audio.dBFS < SILENT_FILE_DBFS:
+                skipped.append((filename, "Audio is silent (the file may be damaged)"))
+                continue
+            if _path_key(filepath) in precut:
+                results.append({
+                    "filename": filename,
+                    "filepath": filepath,
+                    "bpm": analyze_precut(audio),
+                    "segment": SourceClip(audio, filepath, 0.0),
+                    "variation": 0,
+                    "score": None,  # filled in below, once other songs are scored
+                    "beat_offsets": [],
+                    "precut": True,
+                })
+                processed_filenames.append(filename)
+                continue
+
+            info = analyze_track(
+                audio, hook_type=hook_type, locked=_path_key(filepath) in locked,
+                hook_window_sec=segment_bounds(media_type)[1],
+            )
 
             if not info["hooks"]:
                 type_label = HOOK_TYPE_LABELS.get(hook_type, hook_type).replace(" Hook", "")
                 skipped.append((filename, f"No distinct {type_label.lower()} section found"))
                 continue
+            if info["closest_match"]:
+                closest_match.append(filename)
 
             report(f"Detecting hook in {filename}...", percent)
-            for variation, hook in enumerate(info["hooks"]):
+            hooks = info["hooks"]
+            if media_type == MEDIA_VIDEO:
+                # analyze_track returns hooks in time order, and a mix uses
+                # hooks[0] -- for video, make that the strongest-scoring
+                # section instead of just the earliest of the candidates.
+                hooks = sorted(hooks, key=lambda h: h["score"], reverse=True)
+            for variation, hook in enumerate(hooks):
+                start_ms = int(hook["hook_start"] * 1000)
                 segment = extract_hook_segment(audio, hook["hook_start"], hook["hook_end"])
                 results.append({
                     "filename": filename,
+                    "filepath": filepath,
                     "bpm": info["bpm"],
-                    "segment": segment,
+                    "segment": SourceClip(segment, filepath, start_ms / 1000.0),
                     "variation": variation,
                     "score": hook["score"],
                     "beat_offsets": hook.get("beat_offsets", []),
@@ -1066,10 +1631,21 @@ def process_files(filepaths, mode=MODE_LOOP, target_duration_sec=None, hook_type
         report("No tracks could be processed.", 100)
         return {
             "mix": None,
+            "clips": [],
+            "media_type": media_type,
             "processed_filenames": processed_filenames,
             "skipped": skipped,
+            "closest_match": closest_match,
             "total_hooks": 0,
         }
+
+    # A pre-cut song has no hook score of its own (nothing was searched);
+    # give it the batch's median so it sits neutrally in feel ordering.
+    scored = sorted(r["score"] for r in results if r["score"] is not None and r["variation"] == 0)
+    neutral_score = scored[len(scored) // 2] if scored else 0.0
+    for r in results:
+        if r["score"] is None:
+            r["score"] = neutral_score
 
     report("Ordering by feel...", 85)
 
@@ -1096,7 +1672,10 @@ def process_files(filepaths, mode=MODE_LOOP, target_duration_sec=None, hook_type
         hooks = [r["segment"] for r in ordered]
     else:
         songs = _group_by_song(results)
-        if mode == MODE_NORMAL:
+        if media_type == MEDIA_VIDEO:
+            report("Matching transitions...", 87)
+            hooks = _plan_video_mix(songs, target_duration_sec)
+        elif mode == MODE_NORMAL:
             hooks = _plan_normal_mix(songs, target_duration_sec)
         elif mode == MODE_ULTRA:
             hooks = _plan_ultra_mix(songs, target_duration_sec)
@@ -1104,36 +1683,46 @@ def process_files(filepaths, mode=MODE_LOOP, target_duration_sec=None, hook_type
             hooks = _plan_loop_mix(songs, target_duration_sec)
 
     report("Combining tracks...", 90)
-    final_mix = combine_hooks(hooks, CROSSFADE_MS)
+    final_mix = combine_hooks([clip.audio for clip in hooks], CROSSFADE_MS)
 
     report("Done.", 100)
     return {
         "mix": final_mix,
+        "clips": hooks,
+        "media_type": media_type,
         "processed_filenames": processed_filenames,
         "skipped": skipped,
+        "closest_match": closest_match,
         "total_hooks": len(results),
     }
 
 
 def run_cli(input_folder=DEFAULT_INPUT_FOLDER, output_folder=DEFAULT_OUTPUT_FOLDER,
-            output_filename=DEFAULT_OUTPUT_FILENAME):
-    """Command-line entry point: process every audio file in a folder
-    and print progress to the console. Used by mashup.py.
+            output_filename=None, media_type=MEDIA_AUDIO, hook_type=HOOK_TYPE_NORMAL):
+    """Command-line entry point: process every audio (or video) file in a
+    folder and print progress to the console. Used by mashup.py.
     """
     warnings.filterwarnings("ignore")
     os.makedirs(output_folder, exist_ok=True)
+    if output_filename is None:
+        output_filename = (
+            DEFAULT_VIDEO_OUTPUT_FILENAME if media_type == MEDIA_VIDEO else DEFAULT_OUTPUT_FILENAME
+        )
 
-    audio_files = get_audio_files(input_folder)
+    kind = "video" if media_type == MEDIA_VIDEO else "audio"
+    audio_files = get_media_files(input_folder, media_type)
     if not audio_files:
-        print(f"No audio files found in {input_folder}")
+        print(f"No {kind} files found in {input_folder}")
         return
 
-    print(f"Found {len(audio_files)} audio file(s) in {input_folder}\n")
+    print(f"Found {len(audio_files)} {kind} file(s) in {input_folder}\n")
 
     def cli_progress(message, percent):
         print(f"[{percent:3d}%] {message}")
 
-    result = process_files(audio_files, progress_callback=cli_progress)
+    result = process_files(
+        audio_files, hook_type=hook_type, progress_callback=cli_progress, media_type=media_type
+    )
 
     if result["skipped"]:
         print()
@@ -1145,11 +1734,14 @@ def run_cli(input_folder=DEFAULT_INPUT_FOLDER, output_folder=DEFAULT_OUTPUT_FOLD
         return
 
     output_path = os.path.join(output_folder, output_filename)
-    export_mix(result["mix"], output_path)
+    if media_type == MEDIA_VIDEO:
+        render_video_mix(result["clips"], result["mix"], output_path, progress_callback=cli_progress)
+    else:
+        export_mix(result["mix"], output_path)
 
     duration_sec = len(result["mix"]) / 1000.0
-    reprise_count = result["total_hooks"] - len(result["processed_filenames"])
+    reprise_count = len(result["clips"]) - len(result["processed_filenames"])
     print(f"\nDone. Successfully mixed {len(result['processed_filenames'])} of {len(audio_files)} songs "
-          f"({reprise_count} reprise segment(s), {result['total_hooks']} total hooks).")
+          f"({reprise_count} reprise segment(s), {len(result['clips'])} segments in the mix).")
     print(f"Output: {output_path}")
     print(f"Final duration: {duration_sec:.1f}s ({duration_sec / 60:.1f} min)")

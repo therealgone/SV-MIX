@@ -10,7 +10,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFileDialog, QMainWindow, QMessageBox, QStackedWidget, QVBoxLayout, QWidget
 
 import pipeline
-from ..worker import ExportWorker, MixWorker
+from ..worker import ExportWorker, FileCopyWorker, MixWorker
 from .setup_screen import SetupScreen
 from .studio_screen import StudioScreen
 from .title_bar import TitleBar
@@ -25,8 +25,11 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(860, 580)
 
         self._worker = None
+        self._stale_workers = []  # cancelled workers still winding down
         self._export_worker = None
         self._current_mix = None
+        self._media_type = pipeline.MEDIA_AUDIO
+        self._closest_match = []
         self._cancelled = False
         self._pending_skipped = []
         self._temp_dir = tempfile.mkdtemp(prefix="mashup_preview_")
@@ -77,23 +80,67 @@ class MainWindow(QMainWindow):
     # Processing
     # ----------------------------------------------------------------
 
-    def start_processing(self, filepaths, mode, target_duration_sec, hook_type):
+    def start_processing(self, filepaths, mode, target_duration_sec, hook_type,
+                         locked_paths=(), precut_paths=(), media_type=pipeline.MEDIA_AUDIO):
         self._cancelled = False
+        self._media_type = media_type
+        is_video = media_type == pipeline.MEDIA_VIDEO
         mode_label = pipeline.MODE_LABELS.get(mode, mode)
+        if is_video:
+            mode_label += " · MP4"
         hook_label = pipeline.HOOK_TYPE_LABELS.get(hook_type, hook_type).replace(" Hook", "")
-        minutes_target = max(1, round(target_duration_sec / 60))
-        self.studio_screen.start(mode_label, hook_label, minutes_target, len(filepaths))
+        minutes, secs = divmod(int(target_duration_sec), 60)
+        self.studio_screen.start(mode_label, hook_label, f"{minutes}:{secs:02d}", len(filepaths))
         self.title_bar.set_crumb("Session · mixing")
         self.stack.setCurrentWidget(self.studio_screen)
 
-        self._worker = MixWorker(filepaths, mode, target_duration_sec, hook_type)
-        self._worker.progress.connect(self.studio_screen.set_progress)
-        self._worker.finished_ok.connect(self._on_processing_finished)
-        self._worker.failed.connect(self._on_processing_failed)
-        self._worker.start()
+        video_path = (
+            os.path.join(self._temp_dir, f"preview_{uuid.uuid4().hex[:8]}.mp4") if is_video else None
+        )
+        worker = MixWorker(
+            filepaths, mode, target_duration_sec, hook_type,
+            locked_paths=locked_paths, precut_paths=precut_paths,
+            media_type=media_type, video_output_path=video_path,
+        )
+        # Only the current worker's signals count: a cancelled one may
+        # still finish (or fail) after the user has started another mix.
+        worker.progress.connect(
+            lambda m, p, w=worker: self.studio_screen.set_progress(m, p) if w is self._worker else None
+        )
+        worker.finished_ok.connect(
+            lambda r, w=worker: self._on_processing_finished(r) if w is self._worker else None
+        )
+        worker.failed.connect(
+            lambda m, w=worker: self._on_processing_failed(m) if w is self._worker else None
+        )
+        self._worker = worker
+        worker.start()
+
+    def _retire_worker(self):
+        worker, self._worker = self._worker, None
+        if worker is None:
+            return
+        worker.cancel()
+        if worker.isRunning():
+            # Keep a reference until the thread exits -- a QThread that's
+            # garbage-collected while running takes the app down with it.
+            self._stale_workers.append(worker)
+            worker.finished.connect(
+                lambda w=worker: self._stale_workers.remove(w) if w in self._stale_workers else None
+            )
+
+    def _discard_preview(self):
+        self.studio_screen.release_media()
+        if self._preview_path and os.path.exists(self._preview_path):
+            try:
+                os.remove(self._preview_path)
+            except OSError:
+                pass  # still locked by the player; the temp dir goes on exit
+        self._preview_path = None
 
     def cancel_processing(self):
         self._cancelled = True
+        self._retire_worker()
         self.studio_screen.stop_playback()
         self.setup_screen.reset()
         self.title_bar.set_crumb("Session · untitled")
@@ -117,6 +164,15 @@ class MainWindow(QMainWindow):
 
         self._current_mix = result["mix"]
         self._pending_skipped = result["skipped"]
+        self._closest_match = result.get("closest_match", [])
+
+        if result.get("video_path"):
+            # Video mixes are rendered by the worker itself; that file is
+            # the preview, and saving just copies it.
+            self._preview_path = result["video_path"]
+            self._on_preview_ready(self._preview_path)
+            return
+
         self.studio_screen.set_progress("Preparing preview...", 100)
 
         # A fresh filename each time -- QMediaPlayer can skip reloading if
@@ -134,7 +190,11 @@ class MainWindow(QMainWindow):
             return
         duration_seconds = len(self._current_mix) / 1000.0
         n_tracks = getattr(self.studio_screen, "_n_tracks", len(self._pending_skipped))
-        self.studio_screen.set_result(preview_path, duration_seconds, self._pending_skipped, n_tracks)
+        self.studio_screen.set_result(
+            preview_path, duration_seconds, self._pending_skipped, n_tracks,
+            is_video=self._media_type == pipeline.MEDIA_VIDEO,
+            closest_match=self._closest_match,
+        )
         self.title_bar.set_crumb("Session · mix ready")
 
     def _on_preview_failed(self, message):
@@ -147,7 +207,7 @@ class MainWindow(QMainWindow):
 
     def _on_processing_failed(self, message):
         self._worker = None
-        if self._cancelled:
+        if self._cancelled or message == "Cancelled":
             return
         QMessageBox.critical(self, "Processing error", f"Something went wrong:\n{message}")
         self.title_bar.set_crumb("Session · untitled")
@@ -161,18 +221,22 @@ class MainWindow(QMainWindow):
         if self._current_mix is None:
             return
 
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save mix as", "party_mix.mp3", "MP3 Audio (*.mp3)"
-        )
+        is_video = self._media_type == pipeline.MEDIA_VIDEO
+        ext = ".mp4" if is_video else ".mp3"
+        file_filter = "MP4 Video (*.mp4)" if is_video else "MP3 Audio (*.mp3)"
+        path, _ = QFileDialog.getSaveFileName(self, "Save mix as", f"party_mix{ext}", file_filter)
         if not path:
             return
-        if not path.lower().endswith(".mp3"):
-            path += ".mp3"
+        if not path.lower().endswith(ext):
+            path += ext
 
         self.studio_screen.save_button.setEnabled(False)
         self.studio_screen.save_button.setText("Saving…")
 
-        self._export_worker = ExportWorker(self._current_mix, path)
+        if is_video:
+            self._export_worker = FileCopyWorker(self._preview_path, path)
+        else:
+            self._export_worker = ExportWorker(self._current_mix, path)
         self._export_worker.finished_ok.connect(self._on_save_finished)
         self._export_worker.failed.connect(self._on_save_failed)
         self._export_worker.start()
@@ -190,7 +254,7 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Save failed", f"Could not save the file:\n{message}")
 
     def start_new_mix(self):
-        self.studio_screen.stop_playback()
+        self._discard_preview()
         self._current_mix = None
         self.setup_screen.reset()
         self.title_bar.set_crumb("Session · untitled")
@@ -202,8 +266,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._cancelled = True
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.wait()
+        self._retire_worker()
+        for worker in list(self._stale_workers):
+            worker.wait()
         if self._export_worker is not None and self._export_worker.isRunning():
             self._export_worker.wait()
         self.studio_screen.stop_playback()
